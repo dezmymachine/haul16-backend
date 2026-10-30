@@ -15,6 +15,9 @@
 > demo brand "Nkwa Exchange" is fictional. Do not add real sending without legal review, verified
 > recipient addresses and an explicit human-approval design.
 
+**Going live?** Section [9](#9-going-live-running-the-real-version-not-demo-data) lists everything the real (non-demo)
+version needs: data sources and APIs, services, accounts and keys, infrastructure, legal prerequisites and a go-live checklist.
+
 **Product context:** the original working brief (problem, users, scope, architecture decisions, evidence
 standards, channels, demo plan, and which claims are `[VERIFIED]`, `[ASSUMPTION]` or `[UNVERIFIED]`) is in
 [`docs/HAUL16-brief.md`](docs/HAUL16-brief.md). Read it when a product question is not answered here.
@@ -272,7 +275,221 @@ Tests that capture need Chromium installed (`uv run playwright install chromium`
 
 ---
 
-## 9. Known gaps / ideas
+## 9. Going live: running the real version (not demo data)
+
+Everything above runs as a **dry-run demo with a fictional brand**. This section is the checklist for turning it
+into a real service for a real, consenting brand. Read the legal items first: they gate everything else.
+
+> **Status legend.** `REAL TODAY` = already works against live systems with no key. `NEEDS BUILD` = not implemented
+> in this repo; you have to write it. `NEEDS ACCOUNT` = an external signup, key or approval is required.
+> Environment variable names marked *(proposed)* **do not exist in the code yet**: today only `HAUL16_PORT` and
+> `HAUL16_CT` are read. Introduce a single settings module (for example `pydantic-settings`) when you add them.
+> Anything marked `[VERIFY]` is an external process or price that the team has not confirmed. Check the provider's
+> own current documentation before relying on it.
+
+### 9.1 What is already real vs what is simulated
+
+| Capability | Today | For live use |
+|---|---|---|
+| Certificate Transparency watching (5 public logs) | **REAL TODAY**, no key | Keep. Add automatic log-list refresh and lag alerts (9.4) |
+| Lookalike matching, scoring, campaign linking | **REAL TODAY** (deterministic) | Tune on real traffic, measure false positives (9.9) |
+| Page capture (Playwright/Chromium, SSRF-guarded) | **REAL TODAY** | Run in an isolated sandbox with controlled egress (9.5) |
+| Registrar and hosting abuse contacts (public RDAP via `rdap.org`) | **REAL TODAY**, no key | Cache, rate-limit, call registry RDAP servers directly (9.4) |
+| Evidence hashing (SHA-256 page and screenshot, favicon mmh3) | **REAL TODAY** | Move files to immutable object storage (9.6) |
+| Notice drafting from templates | **REAL TODAY** | Lawyer-review every template (9.2) |
+| Human approval, audit log | **REAL TODAY** but the approver is a free-text name | Real login, roles, tamper-evident log (9.7) |
+| **Sending a notice** | **SIMULATED** (`filed_dry_run`, nothing leaves the server) | **NEEDS BUILD**: per-channel senders (9.3) |
+| **Registrar/host/platform responses and removal** | **SIMULATED** (operator clicks "first response", "removed") | **NEEDS BUILD**: inbound mail parsing and automatic liveness re-checks (9.3, 9.8) |
+| Database | SQLite file in `data/` | Postgres (9.6) |
+| Job queue | in-process `asyncio.Queue` (lost on restart) | Durable queue (9.6) |
+| Brand onboarding | edit `brand.yaml` and restart | Onboarding UI + per-brand storage (9.9) |
+| Demo routes (`/api/demo/*`, `/demo-sites`) | on | **Disable or remove in production** (9.12) |
+
+### 9.2 Legal and organisational prerequisites (before any real filing)
+These come from the product brief ([`docs/HAUL16-brief.md`](docs/HAUL16-brief.md), section 10) and are not optional.
+
+1. **Signed authorisation letter from each brand** appointing HAUL16 as designated agent. Its SHA-256 is embedded in every notice
+   (`authorisation_letter` in `brand.yaml`). No letter, no filing.
+2. **Lawyer review** of every template in `channels.yaml` (wrongful-takedown and knowingly-false-notice liability, defamation).
+   Keep notices to evidence-backed statements and say "suspected" until confirmed. Check for a legitimate reseller first.
+3. **Data protection:** screenshots, phone numbers and handles are personal data. Register with the relevant data protection
+   authority, run a DPIA, minimise what you store, and set a retention period (and implement deletion, 9.6). `[VERIFY]` with counsel.
+4. **Regulatory confirmation** that a brand-protection tool for virtual-asset providers is permitted (the brief flags a possible
+   advertising/marketing directive and possible security-service accreditation). Get it in writing. `[VERIFY]`
+5. **Verified recipients.** `channels.yaml` marks telco and CSA recipients `verified: false`. Confirm each address or portal on the
+   organisation's official page and only then set `verified: true`. Third-party guides list conflicting numbers.
+6. **Platform terms:** do not crawl social platforms against their terms. Use official reporting channels and public sources only.
+7. **Do not make vendor-speed claims.** Report the measured median from the takedown clock.
+
+### 9.3 Channels: what each real integration needs
+
+Channel definitions live in `channels.yaml`. Making a channel real means writing a **sender** for its `method` and wiring it to
+`POST /api/notices/{id}/file` (replacing the dry-run state change) **after** the existing human-approval check. Keep a global
+dry-run switch so a deployment can be put back into safe mode.
+
+| Channel (`id`) | Real method | What you need | Status |
+|---|---|---|---|
+| `registrar` | Email to the abuse address from RDAP | Outbound email sender (9.3.1). gTLD registrars have ICANN abuse obligations; ccTLDs follow their own processes | `NEEDS BUILD` |
+| `hosting` | Email to the network abuse contact from RDAP | Same email sender. CDNs (Cloudflare etc.) hide the origin: expect to file with the CDN, which forwards | `NEEDS BUILD` |
+| `google_safe_browsing` | Web Risk **Submission API** (volume) or the manual report form | A Google Cloud project with the Web Risk API enabled and an API key or service account. The Submission API may need allow-listing or approval `[VERIFY]`. Start with the manual form (assisted mode) | `NEEDS ACCOUNT`, `NEEDS BUILD` |
+| Microsoft SmartScreen | Single-URL report form | None for the form; no stable public API known `[VERIFY]`. Assisted mode only | not in catalogue yet |
+| Meta / WhatsApp | Brand Rights Protection portal or in-app report | A rights-holder or authorised-agent account with Meta `[VERIFY]` | not in catalogue yet |
+| X, LinkedIn, TikTok, Telegram | Each platform's impersonation form | A reporter account; some require the rights holder to file or authorise you `[VERIFY]` | not in catalogue yet |
+| `telco_mtn` | Email `mmfraudteam.GH@mtn.com`, or USSD `*170#` then 6 then 4 (cited in the brief from MTN's support page) | Email sender; confirm the address is still current | `NEEDS BUILD` |
+| `telco_telecel`, `telco_airteltigo` | Official fraud desks | **Verify on each operator's official page only** | `NEEDS BUILD`, `[VERIFY]` |
+| `csa` (national cyber security authority) | Incident report (portal/hotline) | Confirm the channel and any trusted-escalation arrangement (the brief lists a CSA conversation as an ask) | `[VERIFY]` |
+| NCA | Spoofing/SIM-abuse complaint | Confirm the channel | not in catalogue yet |
+
+**Assisted mode (recommended first step).** Before automating any sender, ship a mode where the approved notice is shown with
+a "Copy text", an evidence pack download and a link to the recipient's official form, and a human files it by hand, then
+marks it filed. That gives real filings, real clock data and real responses without integration risk. It needs a "filed manually"
+event (store `simulated = 0`) and a small UI change; the state machine otherwise stays the same.
+
+#### 9.3.1 Outbound and inbound email (needed by registrar, hosting, telcos)
+- **Service:** a transactional email provider (for example Amazon SES, Postmark, SendGrid) or your own SMTP. `NEEDS ACCOUNT`.
+- **Domain:** a sending domain you control with **SPF, DKIM and DMARC** configured, or abuse desks will drop the mail.
+  Use a role address such as `takedowns@<your-domain>` with a monitored mailbox.
+- **Keys/settings** *(proposed)*: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD` or a provider `EMAIL_API_KEY`,
+  `EMAIL_FROM`, `EMAIL_REPLY_TO`.
+- **Attachments:** the authorisation letter and an evidence pack per notice (screenshot, HTML, hashes, RDAP record,
+  timestamps) as a zip or PDF. Generating the pack is `NEEDS BUILD`.
+- **Inbound:** to detect responses, receive replies by an inbound-email webhook (a provider feature) or poll a mailbox over IMAP,
+  match them to a notice (a per-notice `Reply-To` or a `ntc_...` token in the subject), and write a
+  `first_response` clock event with `simulated = 0`. `NEEDS BUILD`.
+- **Etiquette:** one notice per recipient per site, no repeat-spamming, handle bounces and keep a suppression list.
+
+### 9.4 Data sources and lookup APIs
+
+| Source | Used for | Key? | Notes |
+|---|---|---|---|
+| Public CT logs (`engine/ct_poll.py`, `LOGS`) | Detect new certificates containing the brand's strings | **No key** | `REAL TODAY`. The log list is hard-coded for 2026 shards. **Automate it**: fetch Google's CT log list (v3 `log_list.json`) on a schedule, add usable RFC 6962 logs, drop retired ones, and alert when a log's backlog (`S.lag`) keeps growing. Respect each log's rate limits |
+| RDAP via `https://rdap.org` (`engine/rdap.py`) | Registrar and hosting abuse contacts | **No key** | `REAL TODAY`. The public bootstrap redirector is rate-limited and has no SLA. In production use the IANA RDAP bootstrap data and query registry/RIR RDAP servers directly, add a cache with a TTL, back off on 429, and store the raw RDAP JSON as evidence. Some ccTLDs have no RDAP (the code already degrades to `unknown`) |
+| DNS (A/AAAA/NS/MX) | Preserve evidence, find hosting origin | No key for live DNS | Log the exact answers and timestamps. Historic DNS needs a paid provider |
+| WHOIS / domain intelligence (WhoisXML API, DomainTools, SecurityTrails, ...) | Registrant data, history, newly-registered feeds | **Paid key**, `NEEDS ACCOUNT` | **Optional.** Mainly for ccTLDs without RDAP. *(proposed)* `WHOIS_API_KEY` |
+| Newly-registered-domain feeds | Catch lookalikes before a certificate exists | Often paid or limited free tiers | **Optional.** CT only sees domains that obtained a certificate. Country-code zone files are generally not public |
+| The brand's own assets | Favicon hash, numbers, wallets, handles, logos | n/a | Collected at onboarding (9.9). Compute `official_favicon_mmh3` from the brand's real favicon |
+| Threat-intel / blocklist feeds (Google Web Risk lookup, PhishTank, OpenPhish, abuse.ch, VirusTotal) | Cross-check a URL before filing; avoid duplicate reports | Varies; some need keys and have usage terms | **Optional.** Extra evidence, never the only reason to file |
+| Blockchain explorers (TronScan, Etherscan, Blockstream) | Wallet activity as extra evidence | Free keys, rate-limited | **Optional**, `NEEDS BUILD`. *(proposed)* `TRONSCAN_API_KEY`, `ETHERSCAN_API_KEY` |
+| Ghana telco prefix list (`TELCO_PREFIX` in `notices.py`) | Route a phone number to the right telco | n/a | A hint only because of number portability. Verify and keep current |
+
+### 9.5 Page capture at real scale (`engine/capture.py`)
+- **Isolation:** run captures in a container or VM per job with no access to your database, secrets or internal network. The in-code
+  SSRF guard blocks private addresses, but defence in depth (network policy, egress allow-list, non-root user, seccomp) is expected
+  because the page is attacker-controlled.
+- **Egress and geography:** some scam kits show different content by country or hide from datacenter IPs. A proxy with local
+  (Ghana, ideally mobile-network) egress improves capture quality. `NEEDS ACCOUNT` (proxy provider), *(proposed)* `CAPTURE_PROXY_URL`.
+  Have counsel confirm the proxy use.
+- **Concurrency and cost:** `Watch(workers=2)` today. A common brand name will queue; size workers, set per-host rate limits and a
+  global cap on captures per hour. The `UNIQUE (brand_id, hostname)` constraint already de-dupes.
+- **Browsers:** `uv run playwright install --with-deps chromium` in the server image. Pin the Playwright version.
+- **Retries:** unreachable hosts retry at 120s, 600s, 1800s (`RETRY_AFTER_S`). Tune from real data and add a later re-check for sites that go live days after the certificate.
+- **Prompt-injection safety:** page text is data. If you add any LLM step, give it no tools, a strict output schema and human review.
+
+### 9.6 Infrastructure and storage
+
+| Need | Demo | Live |
+|---|---|---|
+| Database | SQLite file | **PostgreSQL** (managed). Port the SQL in `engine/store.py` (plain SQL, JSON stored in TEXT columns), add migrations (Alembic), use `jsonb`. `NEEDS BUILD` *(proposed)* `DATABASE_URL` |
+| Evidence files | `data/evidence/` on local disk | **S3-compatible object storage** with versioning, encryption at rest and, for evidence, object-lock/WORM. Keep the SHA-256 in the DB and verify on read. `NEEDS BUILD` *(proposed)* `EVIDENCE_BUCKET` plus cloud credentials or an IAM role |
+| Job queue | `asyncio.Queue` in the API process | Durable queue (Redis with RQ/arq/Celery, or a Postgres-backed queue) and a **separate worker process**, so API restarts do not drop captures and the CT poller can be scaled independently. `NEEDS BUILD` *(proposed)* `REDIS_URL` |
+| CT follower position | starts at each log head on every start | Persist each log's last processed index so a restart does not miss certificates |
+| Retention and deletion | none | Scheduled deletion of evidence and personal data past the retention period; export-on-request tooling |
+| Backups | none | Automated DB backups, tested restores, evidence bucket replication |
+| Hosting | `uvicorn` on a laptop | Container image (Python 3.12 + Chromium), one API instance plus N workers, behind a TLS reverse proxy. Needs long-lived processes: the CT follower and the SSE stream do **not** fit serverless or short-lived functions. Disable proxy buffering for `/api/events` |
+| Observability | `print` | Structured logs, metrics (certs/s, queue depth, capture failures, notice counts), alerts on CT lag and failed sends, error tracking (for example Sentry, *(proposed)* `SENTRY_DSN`) |
+
+### 9.7 Authentication, authorisation and audit (currently missing)
+- **Today:** no login. The approver is whatever name the browser sends. **Do not expose the current API publicly.**
+- **Add:** user login via OIDC/SSO (Auth0, Clerk, Keycloak, Azure AD, Google Workspace) or your own session auth.
+  `NEEDS ACCOUNT`, `NEEDS BUILD`. *(proposed)* `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `SESSION_SECRET`.
+- **Roles:** at least `analyst` (view, redraft), `approver` (approve/reject/file) and `admin` (brand register, users). Enforce them
+  server-side on every mutating route in `engine/api.py`. Take the approver identity from the authenticated session, **not** from the request body.
+- **Multi-tenant:** queries are already scoped by `brand_id`; add a user-to-brand membership check.
+- **Audit:** keep `audit_log` append-only (revoke UPDATE/DELETE for the app role), record user id, IP and the hash of the approved notice
+  text; consider hash-chaining entries so tampering is detectable.
+- **Hardening:** restrict CORS (`engine/api.py`) to the real frontend origin (or serve both from one origin), rate-limit `/api/inject`,
+  add request size limits and security headers, and CSRF protection if you use cookie sessions.
+
+### 9.8 Closing the loop: a real takedown clock
+Today `first_response` and `removed` are clicked by an operator and stored with `simulated = 1`. For live data:
+- **First response:** from inbound email matching (9.3.1), or the operator in assisted mode (store `simulated = 0`).
+- **Removal:** add a scheduled **liveness checker** that re-captures each filed URL (for example at 15 min, 1 h, 6 h, 24 h, then daily for 14 days)
+  and records `removed` when the page returns 404/NXDOMAIN, a registrar/host suspension page, or a browser-warning interstitial.
+  Store the evidence of removal. `NEEDS BUILD`.
+- **Re-hosting watch:** the same operator reappears on new domains with the same kit. Campaign linking on phone/wallet/telegram already
+  catches it while a case is open; consider keeping **closed** cases linkable too.
+- **Report honesty:** `/api/report` medians are only meaningful when events are real. The `simulated` column exists: label simulated rows
+  and exclude them from headline numbers.
+
+### 9.9 Brand onboarding and tuning
+- Replace the single `brand.yaml` with a `brands` table and an onboarding UI/API: display name, seed terms, official domains, handles,
+  numbers, wallets, logo plus computed favicon hashes, allow-list (legitimate resellers), **authorisation letter upload** (store the
+  PDF, compute its SHA-256), contacts and the approver list.
+- **Seed terms are the main false-positive lever.** Short or common words flood the queue. Start narrow, review a week of hits, then widen.
+  Track precision (threats confirmed vs notices rejected) and add an allow-list entry for every legitimate site you find.
+- Bump `RULES_VERSION` for any rules change and keep earlier verdicts for audit.
+- Decide per brand which channels are enabled and which recipients are verified.
+
+### 9.10 Optional: AI-assisted triage (not implemented)
+The brief allows AI for triage and extraction (never for sending). The code today is fully deterministic and calls no model. If you add one:
+*(proposed)* `ANTHROPIC_API_KEY`; use structured output against a fixed schema; run it tool-less on the **extracted text only**;
+treat page content as untrusted; log every prompt and response with the evidence hash; keep the human approval step; and never let a
+model write notice text (templates only, invariant 4).
+
+### 9.11 Configuration and secrets summary
+
+Currently read by the code: `HAUL16_PORT`, `HAUL16_CT`. Everything else below is a **proposal**; add it through one settings module
+and a committed `.env.example` (no real values). Keep real secrets in a secret manager (AWS/GCP Secret Manager, Vault, Doppler or
+your host's secret store), never in git. `.env` is already git-ignored.
+
+| Variable *(proposed)* | Purpose | Needed for live? |
+|---|---|---|
+| `HAUL16_ENV` (`dev` / `prod`) | Switch demo routes off, enforce auth | yes |
+| `HAUL16_DRY_RUN` (`1` / `0`) | Global kill switch for real sending; default `1` | yes |
+| `HAUL16_PORT`, `HAUL16_CT` | **existing** | yes |
+| `DATABASE_URL` | Postgres connection | yes |
+| `REDIS_URL` | Queue and cache | if using Redis |
+| `EVIDENCE_BUCKET` plus cloud credentials | Evidence storage | yes |
+| `SESSION_SECRET`, `OIDC_*` | Login | yes |
+| `SMTP_*` or `EMAIL_API_KEY`, `EMAIL_FROM`, `EMAIL_REPLY_TO` | Send notices | for email channels |
+| `GOOGLE_WEB_RISK_API_KEY` or service-account JSON | Web Risk submission | for that channel |
+| `CAPTURE_PROXY_URL` | Local egress for capture | optional |
+| `WHOIS_API_KEY` | Extra domain intelligence | optional |
+| `TRONSCAN_API_KEY`, `ETHERSCAN_API_KEY` | Wallet context | optional |
+| `ANTHROPIC_API_KEY` | AI triage | optional |
+| `SENTRY_DSN` | Error tracking | recommended |
+| `FRONTEND_ORIGIN` | CORS allow-list | yes |
+
+### 9.12 Switching demo features off in production
+- Do not mount `/demo-sites`, and disable `POST /api/demo/clone` and `POST /api/demo/reset` when `HAUL16_ENV=prod`. **`demo/reset` deletes all data.**
+- Keep `allow_local=True` out of every production route (only fixtures use it).
+- Replace the fictional `brand.yaml` and fixtures, and delete the demo `data/`.
+- Keep **dry run** on until the first real filing is approved by counsel and the brand. Expose the flag in `GET /api/health` (`dry_run`) and have
+  the frontend show a clear **DRY RUN** or **LIVE** indicator from it (today the badge is static text).
+
+### 9.13 Suggested rollout
+1. **Pilot, assisted mode:** one consenting brand, real CT detection and capture, real RDAP, a human files every notice by hand. Measure precision and a real clock.
+2. **Harden:** Postgres, object storage, durable queue, login and roles, backups, monitoring (9.6, 9.7).
+3. **Email senders:** registrar, hosting and telco channels with inbound reply matching (9.3.1).
+4. **API channels:** Web Risk submission and platform integrations as approvals arrive.
+5. **Automation:** liveness checker, re-hosting watch, onboarding UI, report exports (9.8, 9.9).
+6. **Scale:** more brands, more logs, regional proxies, vendor intelligence feeds.
+
+### 9.14 Go-live checklist
+- [ ] Signed authorisation letter on file for the brand; its hash matches the one in notices
+- [ ] Lawyer-approved templates; a written legitimate-reseller check process
+- [ ] Data-protection registration and DPIA done; retention and deletion implemented
+- [ ] Written confirmation of the regulatory status of a brand-protection tool `[VERIFY]`
+- [ ] Every channel recipient verified on official pages; unverified ones stay `verified: false` and cannot be auto-sent
+- [ ] Login and roles on; approver taken from the session; API not reachable without auth
+- [ ] Postgres, object storage, durable queue, backups with a tested restore
+- [ ] Email domain with SPF/DKIM/DMARC; inbound replies matched to notices
+- [ ] CT log-list refresh and lag alerts; RDAP cached and rate-limited
+- [ ] Demo routes disabled; fixtures and demo data removed
+- [ ] `HAUL16_DRY_RUN` flipped to `0` only after the first approved real filing has been rehearsed end to end
+- [ ] Monitoring, alerting and an on-call owner
+
+## 10. Known gaps / ideas
 
 - No auth: the approver is a free-text name sent by the client. A real deployment needs login and role checks.
 - No migrations (see above). SQLite single-writer; fine for the demo scale.
@@ -282,6 +499,6 @@ Tests that capture need Chromium installed (`uv run playwright install chromium`
 - Notices go through `str.format_map`: only add placeholders that exist in `facts_for`, or they render `unknown`.
 - Telco/CSA recipients are unverified placeholders.
 
-## 10. Related
+## 11. Related
 - Product brief: [`docs/HAUL16-brief.md`](docs/HAUL16-brief.md)
 - Frontend: https://github.com/dezmymachine/haul16-frontend
