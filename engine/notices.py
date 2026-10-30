@@ -68,6 +68,18 @@ def facts_for(threat: dict, brand, brand_cfg: dict, case_id: str) -> dict:
     foreign = (verdict.get("evidence") or {}).get("payment_identifier_not_official") or {}
     letter_ref, letter_sha = letter(brand_cfg)
     claim_lines = claims(brand.display_name, verdict)
+
+    ids = cap.get("identifiers") or {}
+    telegrams = ids.get("telegram") or []
+    whatsapps = ids.get("whatsapp") or []
+    raw_handles = brand_cfg.get("official_handles") or []
+    handle_vals = list(raw_handles.values()) if isinstance(raw_handles, dict) else list(raw_handles)
+    official_handles = {str(h).lower().lstrip("@").replace("t.me/", "").replace("https://t.me/", "")
+                        for h in handle_vals}
+    unofficial_telegrams = [t for t in telegrams if t.lower().lstrip("@") not in official_handles]
+    official_numbers = {n.replace(" ", "").replace("-", "") for n in (brand_cfg.get("official_numbers") or [])}
+    unofficial_whatsapps = [w for w in whatsapps if w.replace(" ", "").replace("-", "") not in official_numbers]
+
     return {
         "brand": brand.display_name,
         "brand_domain": ", ".join(brand.official_domains) or "unknown",
@@ -84,6 +96,10 @@ def facts_for(threat: dict, brand, brand_cfg: dict, case_id: str) -> dict:
         "wallets": ", ".join(foreign.get("wallets", [])) or "none",
         "phone_list": foreign.get("phones", []),
         "wallet_list": foreign.get("wallets", []),
+        "telegrams": ", ".join(unofficial_telegrams) or "none",
+        "telegram_list": unofficial_telegrams,
+        "whatsapps": ", ".join(unofficial_whatsapps) or "none",
+        "whatsapp_list": unofficial_whatsapps,
         "registrar": reg.get("registrar") or "unknown",
         "registrar_abuse_email": reg.get("registrar_abuse_email") or None,
         # Only a domain the registry actually knows has a registrar to write to.
@@ -108,6 +124,8 @@ def applies(rule: str, f: dict) -> bool:
         "has_phone_mtn": any(p.startswith(TELCO_PREFIX["mtn"]) for p in phones),
         "has_phone_telecel": any(p.startswith(TELCO_PREFIX["telecel"]) for p in phones),
         "has_phone_at": any(p.startswith(TELCO_PREFIX["at"]) for p in phones),
+        "has_telegram": bool(f.get("telegram_list")),
+        "has_whatsapp": bool(f.get("whatsapp_list")),
     }.get(rule, False)
 
 

@@ -22,7 +22,11 @@ STRONG = {"logo_or_favicon_match", "payment_identifier_not_official", "homoglyph
 LURES = re.compile(
     r"double your|guaranteed (?:returns?|profit)|\bbonus\b|airdrop|send (?:your )?deposit|activate your|"
     r"limited (?:time|offer|bonus)|withdraw(?:al)? fee|verify your (?:wallet|account)|giveaway|"
-    r"customer support desk|support agent",
+    r"customer support desk|support agent|"
+    r"daily (?:returns?|profit|earning|income)|instant (?:payout|withdrawal|cashout)|"
+    r"investment (?:package|plan|scheme)|vip signals?|trading signals?|"
+    r"ghana cedi|ghs|gh¢|momo (?:bonus|airdrop|deposit|transfer|agent)|"
+    r"mobile money (?:bonus|deposit|agent)|risk[- ]free (?:investment|trading)",
     re.I,
 )
 
@@ -43,9 +47,9 @@ def score(brand: Brand, cand: Candidate | None, cap: Capture) -> Verdict:
         for r in cand.reasons:
             reasons[r] = f"hostname {cand.display} vs seed '{cand.seed}'"
 
-    if cap.errors and not cap.html_sha256:
+    if (cap.errors and not cap.html_sha256) or cap.status in (502, 503, 504) or (cap.status is None and cap.errors):
         return Verdict("unknown", cand.priority if cand else 0, sorted(reasons),
-                       {**reasons, "page_unreachable": cap.errors[0]})
+                       {**reasons, "page_unreachable": cap.errors[0] if cap.errors else f"HTTP {cap.status} unreachable"})
 
     page = skeleton(f"{cap.title or ''}\n{cap.text_excerpt}".lower())
     names = [brand.display_name.lower()] + brand.seed_terms

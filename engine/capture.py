@@ -21,6 +21,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import mmh3
+import os
 from playwright.async_api import async_playwright
 
 from engine.extract import extract
@@ -28,8 +29,21 @@ from engine.extract import extract
 CAPTURE_TOOL = "haul16-capture/0.1 (playwright-chromium)"
 ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE_DIR = ROOT / "data" / "evidence"
-TIMEOUT_MS = 20_000
+TIMEOUT_MS = 25_000
 MAX_TEXT = 200_000
+
+
+def _load_env_if_present() -> None:
+    env_path = ROOT / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+
+
+_load_env_if_present()
 
 
 @dataclass
@@ -90,14 +104,39 @@ async def capture(url: str, allow_local: bool = False, out_dir: Path = EVIDENCE_
                 return await route.abort()
         await route.continue_()
 
+    bb_key = os.environ.get("BROWSERBASE_API_KEY", "")
+    host = urlparse(url).hostname or ""
+    is_dummy = host.endswith(".invalid") or host.endswith(".test") or host.endswith(".local") or host == "localhost"
+    use_browserbase = bool(bb_key and not allow_local and not is_dummy and not _is_private(host))
+
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(args=["--disable-extensions", "--disable-sync", "--no-first-run"])
-        ctx = await browser.new_context(
-            accept_downloads=False, java_script_enabled=True, ignore_https_errors=True,
-            viewport={"width": 1280, "height": 900}, service_workers="block", permissions=[],
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36",
-        )
-        await ctx.route("**/*", guard)
+        browser = None
+        is_cloud = False
+        if use_browserbase:
+            try:
+                # Browserbase Developer Plan with residential proxy support & captcha solving
+                cdp_url = f"wss://connect.browserbase.com?apiKey={bb_key}&enableProxy=true"
+                browser = await pw.chromium.connect_over_cdp(cdp_url, timeout=15000)
+                is_cloud = True
+                cap.capture_tool = "haul16-capture/0.1 (browserbase-cloud-proxy)"
+            except Exception as bb_err:
+                cap.errors.append(f"BrowserbaseFallback: {type(bb_err).__name__}: {str(bb_err)[:150]}")
+                browser = None
+
+        if browser is None:
+            browser = await pw.chromium.launch(args=["--disable-extensions", "--disable-sync", "--no-first-run"])
+            cap.capture_tool = CAPTURE_TOOL
+
+        if is_cloud and browser.contexts:
+            ctx = browser.contexts[0]
+        else:
+            ctx = await browser.new_context(
+                accept_downloads=False, java_script_enabled=True, ignore_https_errors=True,
+                viewport={"width": 1280, "height": 900}, service_workers="block", permissions=[],
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36",
+            )
+        if not is_cloud:
+            await ctx.route("**/*", guard)
         page = await ctx.new_page()
         page.on("dialog", lambda d: asyncio.ensure_future(d.dismiss()))
         try:

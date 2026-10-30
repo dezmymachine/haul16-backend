@@ -143,3 +143,60 @@ channels:
       What we observed:
       {claims}
       Evidence captured {captured_at} UTC (page SHA-256 {html_sha256}).
+
+  - id: telegram_abuse
+    name: Telegram Impersonation & Fraud Desk
+    applies_when: has_telegram
+    method: email
+    recipient: "abuse@telegram.org"
+    verified: true
+    expected_response: "Telegram investigates reports of fraudulent channels and applies a SCAM tag or suspends access. Typical: 24 to 72 hours."
+    evidence_checklist: [telegram_handles, url, screenshot, brand_targeted, authorisation_letter]
+    subject: "Fraud report: unauthorized channel {telegrams} impersonating {brand}"
+    body: |
+      To the Telegram Abuse Team,
+
+      We act as authorised agent for {brand} (official site: {brand_domain}). Our signed
+      authorisation letter is on file (SHA-256 {letter_sha256}).
+
+      The Telegram handle(s)/channel(s): {telegrams}
+      are actively promoted on fraudulent website {url} (page source SHA-256: {html_sha256})
+      to solicit deposits and investments from the public by falsely impersonating {brand}.
+
+      What we observed on the linking website:
+      {claims}
+
+      Evidence captured {captured_at} UTC:
+      - Host: {host}
+      - Screenshot SHA-256: {screenshot_sha256}
+
+      Under Telegram's Terms of Service against fraud and brand impersonation, we request the
+      immediate suspension or application of the SCAM tag to the listed handle(s).
+
+  - id: meta_whatsapp
+    name: WhatsApp / Meta Brand Rights Desk
+    applies_when: has_whatsapp
+    method: email
+    recipient: "phishing@support.whatsapp.com"
+    verified: true
+    expected_response: "WhatsApp Trust & Safety reviews accounts engaged in impersonation and fraud. Accounts found in violation are banned from the WhatsApp network."
+    evidence_checklist: [whatsapp_numbers, url, screenshot, authorisation_letter]
+    subject: "Phishing notice: WhatsApp account {whatsapps} targeting {brand}"
+    body: |
+      To the WhatsApp Trust & Safety / Phishing Investigation Team,
+
+      We represent {brand} (official site: {brand_domain}) as authorised agent (authorisation
+      letter SHA-256: {letter_sha256}).
+
+      The WhatsApp contact/link: {whatsapps}
+      is being used on phishing and deposit scam website {url} to communicate with victims
+      and solicit unauthorized deposits while posing as {brand}'s official support.
+
+      Evidence captured {captured_at} UTC:
+      - Site screenshot SHA-256: {screenshot_sha256}
+      - Site HTML SHA-256: {html_sha256}
+      - Observed claims:
+      {claims}
+
+      We request that the associated WhatsApp account(s) be investigated and restricted for
+      violations of WhatsApp policies against phishing and commercial impersonation.
