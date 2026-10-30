@@ -1,0 +1,367 @@
+"""HAUL16 API: the watch loop, the case desk and the report behind one FastAPI app.
+
+  uv run uvicorn engine.api:app --port 8000
+  HAUL16_CT=0 uv run uvicorn engine.api:app --port 8000     # without live CT polling
+
+DRY RUN: nothing is ever sent to a registrar, host, platform, telco or regulator.
+"""
+import asyncio
+import json
+import os
+import re
+import statistics
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from engine import ct_poll, notices
+from engine.pipeline import Pipeline
+from engine.store import DB_PATH, Store
+from engine.worker import Watch, load_brand
+
+ROOT = Path(__file__).resolve().parents[1]
+EVIDENCE = ROOT / "data" / "evidence"
+PORT = int(os.environ.get("HAUL16_PORT", "8000"))
+CT_ENABLED = os.environ.get("HAUL16_CT", "1") != "0"
+DEMO_HOSTS = {"clone": "nkwaex-support.com", "clone2": "nkwaex-airdrop.top", "decoy": "nkwafarms.com"}
+
+
+class State:
+    watch: Watch
+    store: Store
+    pipe: Pipeline
+    lag: dict
+    started: float
+    ct_status: str = "off"
+
+
+S = State()
+
+
+async def ct_loop() -> None:
+    """Follow every CT log; restart a log's follower if it dies."""
+    limits = httpx.Limits(max_connections=ct_poll.PARALLEL * len(ct_poll.LOGS))
+    async with httpx.AsyncClient(timeout=20, limits=limits,
+                                 headers={"User-Agent": "haul16-ct-monitor/0.1"}) as client:
+        async def keep(name, url):
+            while True:
+                try:
+                    S.ct_status = "live"
+                    await ct_poll.follow(client, name, url, S.pipe, None, S.lag)
+                except Exception as e:
+                    print(f"ct {name} restarting after {e!r}", flush=True)
+                    await asyncio.sleep(5)
+        await asyncio.gather(*(keep(n, u) for n, u in ct_poll.LOGS.items()))
+
+
+def ct_snapshot() -> dict:
+    s = S.pipe.stats
+    el = max(time.monotonic() - S.started, 1e-9)
+    return {"status": S.ct_status, "logs": len(ct_poll.LOGS), "certs": s["certs"],
+            "unique_domains": s["unique_domains"], "hits": s["hits"],
+            "certs_per_s": round(s["certs"] / el, 1), "uptime_s": round(el), "backlog": dict(S.lag)}
+
+
+async def stats_ticker() -> None:
+    last = 0
+    while True:
+        await asyncio.sleep(2)
+        snap = ct_snapshot()
+        snap["rate_now"] = round((snap["certs"] - last) / 2, 1)
+        last = snap["certs"]
+        S.watch.publish({"type": "ct_stats", **snap})
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    brand, cfg = load_brand(ROOT / "brand.yaml")
+    S.store = Store(DB_PATH)
+    S.watch = Watch(brand, S.store, brand_cfg=cfg, workers=2)
+    S.pipe = Pipeline(S.watch.matcher, ROOT / "data" / "hits.jsonl", on_hit=S.watch.on_hit)
+    S.lag, S.started = {}, time.monotonic()
+    tasks = [asyncio.create_task(S.watch.capture_worker()) for _ in range(S.watch.workers)]
+    tasks.append(asyncio.create_task(stats_ticker()))
+    if CT_ENABLED:
+        tasks.append(asyncio.create_task(ct_loop()))
+    yield
+    for t in tasks:
+        t.cancel()
+
+
+app = FastAPI(title="HAUL16", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+                   allow_methods=["*"], allow_headers=["*"])
+app.mount("/demo-sites", StaticFiles(directory=ROOT / "fixtures" / "sites", html=True), name="demo-sites")
+
+
+# ---- brand, stats, feed -----------------------------------------------------
+
+@app.get("/api/health")
+def health():
+    return {"ok": True, "dry_run": True, "ct_enabled": CT_ENABLED}
+
+
+@app.get("/api/brand")
+def brand():
+    cfg = dict(S.watch.brand_cfg)
+    ref, sha = notices.letter(cfg)
+    cfg["authorisation_letter"] = {"ref": ref, "sha256": sha}
+    return cfg
+
+
+@app.get("/api/stats")
+def stats():
+    return {"counts": S.store.counts(S.watch.brand.brand_id), "ct": ct_snapshot(),
+            "queue": S.watch.queue.qsize(), "dry_run": True}
+
+
+@app.get("/api/threats")
+def threats(confidence: str | None = None, limit: int = 200):
+    rows = S.store.threats(S.watch.brand.brand_id, limit=limit, confidence=confidence)
+    for r in rows:                                   # keep the list light
+        cap = r.pop("capture", None) or {}
+        r["screenshot_ref"] = cap.get("screenshot_ref")
+        r["title"] = cap.get("title")
+        r.pop("enrichment", None)
+    return rows
+
+
+@app.get("/api/threats/{tid}")
+def threat(tid: str):
+    t = S.store.threat(tid)
+    if not t:
+        raise HTTPException(404, "No such threat")
+    return t
+
+
+@app.get("/api/cases")
+def cases():
+    return S.store.cases(S.watch.brand.brand_id)
+
+
+@app.get("/api/cases/{case_id}")
+def case(case_id: str):
+    c = S.store.case(case_id)
+    if not c:
+        raise HTTPException(404, "No such case")
+    return c
+
+
+@app.post("/api/cases/{case_id}/redraft")
+def redraft(case_id: str):
+    c = S.store.case(case_id)
+    if not c:
+        raise HTTPException(404, "No such case")
+    n = 0
+    for t in c["threats"]:
+        n += S.store.add_notices(case_id, notices.draft(t, S.watch.brand, S.watch.brand_cfg, case_id), t["id"])
+    return {"drafted": n}
+
+
+@app.get("/api/audit")
+def audit(limit: int = 100):
+    return [S.store._row(r) for r in S.store.db.execute(
+        "SELECT * FROM audit_log ORDER BY ts DESC LIMIT ?", (limit,))]
+
+
+# ---- notices: human approval is enforced here ---------------------------------
+
+@app.get("/api/notices")
+def list_notices(status: str | None = None):
+    if status and status not in ("drafted", "approved", "filed_dry_run", "rejected"):
+        raise HTTPException(422, "Unknown notice status")
+    return S.store.all_notices(S.watch.brand.brand_id, status)
+
+
+class Approve(BaseModel):
+    approver: str = Field(min_length=2, max_length=80)
+
+
+class Reject(Approve):
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class ClockIn(BaseModel):
+    event: str = Field(pattern="^(first_response|removed)$")
+    note: str | None = Field(default=None, max_length=500)
+
+
+def _notice(nid: str) -> dict:
+    n = S.store.notice(nid)
+    if not n:
+        raise HTTPException(404, "No such notice")
+    return n
+
+
+@app.post("/api/notices/{nid}/approve")
+def approve(nid: str, body: Approve):
+    n = _notice(nid)
+    if n["status"] != "drafted":
+        raise HTTPException(409, f"Notice is {n['status']}, only drafts can be approved")
+    S.store.approve_notice(nid, body.approver.strip())
+    return S.store.notice(nid)
+
+
+@app.post("/api/notices/{nid}/reject")
+def reject(nid: str, body: Reject):
+    n = _notice(nid)
+    if n["status"] not in ("drafted", "approved"):
+        raise HTTPException(409, f"Notice is {n['status']}")
+    S.store.reject_notice(nid, body.approver.strip(), body.reason)
+    return S.store.notice(nid)
+
+
+@app.post("/api/notices/{nid}/file")
+def file_notice(nid: str):
+    n = _notice(nid)
+    if n["status"] != "approved":
+        raise HTTPException(409, "A person must approve this notice before it is filed")
+    S.store.file_notice(nid, n["approved_by"])
+    S.watch.publish({"type": "filed", "notice_id": nid, "case_id": n["case_id"], "channel": n["channel"]})
+    return S.store.notice(nid)
+
+
+@app.post("/api/notices/{nid}/clock")
+def clock(nid: str, body: ClockIn):
+    n = _notice(nid)
+    if n["status"] != "filed_dry_run":
+        raise HTTPException(409, "File the notice before logging a response")
+    S.store.clock_event(n["case_id"], nid, n["channel"], body.event, body.note, simulated=True)
+    return S.store.clock(n["case_id"])
+
+
+# ---- intake -----------------------------------------------------------------
+
+class InjectIn(BaseModel):
+    url: str = Field(pattern=r"^https?://", max_length=2000)
+    as_host: str | None = Field(default=None, max_length=253)
+
+
+@app.post("/api/inject")
+def inject(body: InjectIn):
+    tid = S.watch.inject(body.url, body.as_host, source="manual", allow_local=False)
+    return {"threat_id": tid, "duplicate": tid is None}
+
+
+class DemoIn(BaseModel):
+    variant: str = Field(pattern="^(clone|clone2|decoy)$")
+
+
+@app.post("/api/demo/clone")
+def demo_clone(body: DemoIn):
+    """Push a fictional fixture site through the real pipeline (served by this API)."""
+    host = DEMO_HOSTS[body.variant]
+    url = f"http://127.0.0.1:{PORT}/demo-sites/{body.variant}/"
+    tid = S.watch.inject(url, host, source="demo_fixture", allow_local=True)
+    if tid is None:
+        existing = S.store.db.execute("SELECT id FROM threats WHERE hostname=?", (host,)).fetchone()
+        return {"threat_id": existing[0] if existing else None, "duplicate": True, "host": host}
+    return {"threat_id": tid, "duplicate": False, "host": host}
+
+
+@app.post("/api/demo/reset")
+def demo_reset():
+    """Wipe cases, threats and notices (demo rehearsal only)."""
+    for t in ("threats", "cases", "identifiers", "notices", "clock_events", "audit_log"):
+        S.store.db.execute(f"DELETE FROM {t}")
+    S.store.db.commit()
+    S.watch.attempts.clear()
+    S.store.audit("operator", "demo_reset")
+    return {"ok": True}
+
+
+# ---- evidence ---------------------------------------------------------------
+
+@app.get("/api/evidence/{name}")
+def evidence(name: str):
+    if not re.fullmatch(r"[0-9A-Za-z+_.-]{10,120}\.(png|html)", name):
+        raise HTTPException(400, "Bad evidence name")
+    p = EVIDENCE / name
+    if not p.exists():
+        raise HTTPException(404, "No such evidence file")
+    media = "image/png" if name.endswith(".png") else "text/plain; charset=utf-8"
+    return FileResponse(p, media_type=media)
+
+
+# ---- report -----------------------------------------------------------------
+
+def _ts(s: str) -> datetime:
+    return datetime.fromisoformat(s)
+
+
+@app.get("/api/report")
+def report(month: str | None = None):
+    month = month or datetime.now().strftime("%Y-%m")
+    if not re.fullmatch(r"\d{4}-\d{2}", month):
+        raise HTTPException(400, "month must be YYYY-MM")
+    bid = S.watch.brand.brand_id
+    in_month = lambda ts: bool(ts) and ts.startswith(month)  # noqa: E731
+    threats_ = [t for t in S.store.threats(bid, limit=100000) if in_month(t["detected_at"])]
+    cases_ = [c for c in S.store.cases(bid) if in_month(c["opened_at"])]
+    events = [e for e in S.store.all_clock(bid) if in_month(e["ts"])]
+
+    filed_at = {e["notice_id"]: e["ts"] for e in events if e["event"] == "filed"}
+    per_channel: dict[str, dict] = {}
+    for e in events:
+        ch = per_channel.setdefault(e["channel"] or "case", {"filed": 0, "first_response": 0, "removed": 0,
+                                                              "detect_to_removed_min": [], "file_to_removed_min": []})
+        ch[e["event"]] = ch.get(e["event"], 0) + 1
+        if e["event"] == "removed":
+            ch["detect_to_removed_min"].append((_ts(e["ts"]) - _ts(e["detected_at"])).total_seconds() / 60)
+            if e["notice_id"] in filed_at:
+                ch["file_to_removed_min"].append((_ts(e["ts"]) - _ts(filed_at[e["notice_id"]])).total_seconds() / 60)
+    channels = []
+    for name, ch in sorted(per_channel.items()):
+        d2r, f2r = ch.pop("detect_to_removed_min"), ch.pop("file_to_removed_min")
+        channels.append({"channel": name, **ch,
+                         "median_detect_to_removed_min": round(statistics.median(d2r), 1) if d2r else None,
+                         "median_file_to_removed_min": round(statistics.median(f2r), 1) if f2r else None})
+
+    by_conf: dict[str, int] = {}
+    for t in threats_:
+        by_conf[t["confidence"] or "pending"] = by_conf.get(t["confidence"] or "pending", 0) + 1
+    return {
+        "brand": S.watch.brand.display_name, "month": month, "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "dry_run": True,
+        "limitations": ["Dry run: no notice was sent to any recipient.",
+                        "Responses and removals are logged by an operator and marked simulated.",
+                        "Detection covers Certificate Transparency logs and manual submissions only."],
+        "threats_detected": len(threats_), "threats_by_confidence": by_conf,
+        "cases_opened": len(cases_),
+        "notices": {s: sum(1 for c in cases_ for n in S.store.notices(c["id"]) if n["status"] == s)
+                    for s in ("drafted", "approved", "filed_dry_run", "rejected")},
+        "channels": channels,
+        "cases": [{"id": c["id"], "opened_at": c["opened_at"], "threats": c["threat_count"],
+                   "filed": c["filed_count"], "removed": c["removed_count"], "status": c["status"]} for c in cases_],
+    }
+
+
+# ---- live events (SSE) -------------------------------------------------------
+
+@app.get("/api/events")
+async def events(request: Request):
+    q: asyncio.Queue = asyncio.Queue()
+    S.watch.subscribers.add(q)
+
+    async def stream():
+        try:
+            yield f"data: {json.dumps({'type': 'ct_stats', **ct_snapshot()})}\n\n"
+            while not await request.is_disconnected():
+                try:
+                    ev = await asyncio.wait_for(q.get(), timeout=15)
+                    yield f"data: {json.dumps(ev)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            S.watch.subscribers.discard(q)
+
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

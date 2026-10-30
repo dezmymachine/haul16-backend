@@ -1,0 +1,36 @@
+# Official asset register for ONE brand. Every detection is a diff against this file.
+# PLACEHOLDER: "Nkwa Exchange" is a made-up demo brand. Replace it with the team's
+# fictional brand once chosen, and collision-check the name before the demo.
+fictional: true
+brand_id: brand_demo
+display_name: Nkwa Exchange
+
+# Strings a scammer would put in a domain or page. Lowercase, letters/digits only.
+seed_terms:
+  - nkwaex
+  - nkwaexchange
+
+# Hostnames we own. These and any subdomain of them are never flagged.
+official_domains:
+  - nkwaex.com
+
+official_handles:
+  x: "@nkwaex"
+  linkedin: "company/nkwa-exchange"
+
+# Numbers and wallets the brand actually uses. A page using the brand with a
+# number NOT on this list is the strongest clone signal.
+official_numbers:
+  - "0302000000"
+official_wallets: []
+
+# Favicon fingerprints of official sites (Shodan-style mmh3). Clones often copy the icon byte for byte.
+# Computed with: uv run python -c "from engine.capture import favicon_hash; print(favicon_hash(open(PATH,'rb').read()))"
+official_favicon_mmh3:
+  - 834202372
+
+# Signed letter appointing HAUL16 as authorised agent. Its SHA-256 goes in every notice.
+authorisation_letter: fixtures/authorisation_letter_demo.txt
+
+# Legit partners and resellers allowed to use the name.
+allowlist_domains: []

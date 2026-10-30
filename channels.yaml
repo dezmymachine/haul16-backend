@@ -1,0 +1,145 @@
+# Channel catalogue: where a takedown notice goes, when it applies, and what it must contain.
+# Data, not code: add a channel here without touching Python.
+# DRY RUN: HAUL16 never sends these. Recipients marked verified: false must be confirmed
+# on the channel's official page before any real filing.
+#
+# Template placeholders are filled ONLY from captured evidence or the brand register:
+#   {brand} {brand_domain} {host} {url} {detected_at} {captured_at} {html_sha256}
+#   {screenshot_sha256} {screenshot_ref} {claims} {phones} {wallets} {registrar}
+#   {registered_domain} {created} {network} {ip} {letter_ref} {letter_sha256} {case_id}
+
+channels:
+  - id: registrar
+    name: Domain registrar abuse desk
+    applies_when: has_registered_domain
+    method: email
+    recipient_from: registrar_abuse_email
+    verified: true          # address comes from the registry's own RDAP record
+    expected_response: "ICANN-accredited registrars must investigate abuse reports for gTLDs. Typical: days."
+    evidence_checklist: [url, capture_time, page_hash, screenshot, rdap_record, authorisation_letter]
+    subject: "Abuse report: {registered_domain} impersonating {brand} (case {case_id})"
+    body: |
+      To the abuse team of {registrar},
+
+      We act as authorised agent for {brand} (official site: {brand_domain}). Our signed
+      authorisation letter is attached (SHA-256 {letter_sha256}).
+
+      The domain {registered_domain} (created {created}) hosts a page at {url} that we believe
+      impersonates {brand} to collect payments from the public.
+
+      What we observed:
+      {claims}
+
+      Evidence captured {captured_at} UTC:
+      - Page source SHA-256: {html_sha256}
+      - Screenshot SHA-256: {screenshot_sha256}
+
+      We ask you to suspend the domain under your abuse policy. We can provide the full evidence
+      pack on request.
+
+  - id: hosting
+    name: Hosting provider abuse desk
+    applies_when: has_hosting
+    method: email
+    recipient_from: host_abuse_email
+    verified: true          # from the IP network's RDAP abuse contact
+    expected_response: "Depends on the provider's acceptable use policy. CDNs may only forward to the origin host."
+    evidence_checklist: [url, ip, capture_time, page_hash, screenshot, authorisation_letter]
+    subject: "AUP violation: phishing page impersonating {brand} at {host} ({ip})"
+    body: |
+      To the abuse team of {network},
+
+      A page served from {ip} at {url} impersonates {brand} (official site: {brand_domain}).
+      We act as authorised agent for {brand} (letter SHA-256 {letter_sha256}).
+
+      What we observed:
+      {claims}
+
+      Evidence captured {captured_at} UTC: page SHA-256 {html_sha256}, screenshot SHA-256
+      {screenshot_sha256}.
+
+      We ask you to remove the content under your acceptable use policy.
+
+  - id: google_safe_browsing
+    name: Google Safe Browsing
+    applies_when: has_url
+    method: web_form
+    recipient: "https://safebrowsing.google.com/safebrowsing/report_phish/"
+    verified: true
+    expected_response: "No reply. Listing shows up as a browser warning. Web Risk Submission API exists for volume (enterprise)."
+    evidence_checklist: [url, brand_targeted]
+    subject: "Phishing report: {url}"
+    body: |
+      URL: {url}
+      Impersonated brand: {brand} ({brand_domain})
+      Why: {claims}
+
+  - id: telco_mtn
+    name: MTN Ghana MoMo fraud team
+    applies_when: has_phone_mtn
+    method: email
+    recipient: "mmfraudteam.GH@mtn.com"
+    verified: true          # MTN Ghana support page; also *170# > 6 > 4
+    expected_response: "Unknown. We will measure it."
+    evidence_checklist: [phone_numbers, url, screenshot, authorisation_letter]
+    subject: "MoMo number used to impersonate {brand}: {phones}"
+    body: |
+      To the MTN Ghana Mobile Money fraud team,
+
+      We act as authorised agent for {brand} (letter SHA-256 {letter_sha256}). The number(s)
+      {phones} appear on a page at {url} that impersonates {brand} and asks the public to send
+      deposits. {brand} does not use these numbers. Its only official numbers are on {brand_domain}.
+
+      What we observed:
+      {claims}
+
+      Screenshot SHA-256 {screenshot_sha256}, captured {captured_at} UTC.
+
+      We ask you to investigate and, where your policy allows, block the wallet(s).
+
+  - id: telco_telecel
+    name: Telecel Ghana fraud desk
+    applies_when: has_phone_telecel
+    method: email
+    recipient: "UNVERIFIED: confirm on Telecel Ghana's official site"
+    verified: false
+    expected_response: "Unknown."
+    evidence_checklist: [phone_numbers, url, screenshot, authorisation_letter]
+    subject: "Number used to impersonate {brand}: {phones}"
+    body: |
+      We act as authorised agent for {brand}. The number(s) {phones} appear on {url}, a page
+      impersonating {brand}. What we observed:
+      {claims}
+      Screenshot SHA-256 {screenshot_sha256}, captured {captured_at} UTC.
+
+  - id: telco_airteltigo
+    name: AirtelTigo (AT) fraud desk
+    applies_when: has_phone_at
+    method: email
+    recipient: "UNVERIFIED: confirm on AT Ghana's official site"
+    verified: false
+    expected_response: "Unknown."
+    evidence_checklist: [phone_numbers, url, screenshot, authorisation_letter]
+    subject: "Number used to impersonate {brand}: {phones}"
+    body: |
+      We act as authorised agent for {brand}. The number(s) {phones} appear on {url}, a page
+      impersonating {brand}. What we observed:
+      {claims}
+      Screenshot SHA-256 {screenshot_sha256}, captured {captured_at} UTC.
+
+  - id: csa
+    name: Cyber Security Authority (CSA) incident report
+    applies_when: has_payment_identifier
+    method: web_form
+    recipient: "UNVERIFIED: CSA incident portal / 292 hotline, confirm on csa.gov.gh"
+    verified: false
+    expected_response: "Opaque. No published block or takedown rates."
+    evidence_checklist: [url, phone_numbers, wallets, screenshot, authorisation_letter]
+    subject: "Online fraud report: impersonation of {brand} ({case_id})"
+    body: |
+      Reporting organisation: HAUL16, as authorised agent for {brand} ({brand_domain}).
+      Suspected fraudulent page: {url}
+      Payment identifiers on the page: {phones} {wallets}
+      What we observed:
+      {claims}
+      Evidence captured {captured_at} UTC (page SHA-256 {html_sha256}).
