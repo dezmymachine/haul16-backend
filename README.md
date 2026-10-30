@@ -15,6 +15,10 @@
 > demo brand "Nkwa Exchange" is fictional. Do not add real sending without legal review, verified
 > recipient addresses and an explicit human-approval design.
 
+**Product context:** the original working brief (problem, users, scope, architecture decisions, evidence
+standards, channels, demo plan, and which claims are `[VERIFIED]`, `[ASSUMPTION]` or `[UNVERIFIED]`) is in
+[`docs/HAUL16-brief.md`](docs/HAUL16-brief.md). Read it when a product question is not answered here.
+
 This repo is the **backend** (Python 3.12+, FastAPI, SQLite, Playwright). The operator console is a
 separate repo: **[dezmymachine/haul16-frontend](https://github.com/dezmymachine/haul16-frontend)**
 (TanStack Start + shadcn/ui). If you are an agent picking this up, read this file fully; the
@@ -279,4 +283,5 @@ Tests that capture need Chromium installed (`uv run playwright install chromium`
 - Telco/CSA recipients are unverified placeholders.
 
 ## 10. Related
+- Product brief: [`docs/HAUL16-brief.md`](docs/HAUL16-brief.md)
 - Frontend: https://github.com/dezmymachine/haul16-frontend
