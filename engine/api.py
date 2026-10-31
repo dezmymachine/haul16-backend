@@ -6,13 +6,14 @@
 DRY RUN: nothing is ever sent to a registrar, host, platform, telco or regulator.
 """
 import asyncio
+import hashlib
 import json
 import os
 import re
 import statistics
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -23,8 +24,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from engine import ct_poll, notices
+from engine.matcher import RULES_VERSION
 from engine.pipeline import Pipeline
-from engine.store import DB_PATH, Store
+from engine.store import DB_PATH, LINKING_KINDS, Store
 from engine.worker import Watch, load_brand
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -155,6 +157,101 @@ def case(case_id: str):
     return c
 
 
+@app.get("/api/cases/{case_id}/dossier")
+def case_dossier(case_id: str):
+    c = S.store.case(case_id)
+    if not c:
+        raise HTTPException(404, "No such case")
+
+    brand_cfg = S.watch.brand_cfg
+    letter_ref, letter_sha = notices.letter(brand_cfg)
+
+    threat_summaries = []
+    for t in c["threats"]:
+        cap = t.get("capture") or {}
+        verd = t.get("verdict") or {}
+        enr = t.get("enrichment") or {}
+        threat_summaries.append({
+            "threat_id": t["id"],
+            "hostname": t["hostname"],
+            "url": cap.get("final_url") or t.get("url") or f"https://{t['hostname']}/",
+            "detected_at": t["detected_at"],
+            "captured_at": cap.get("captured_at"),
+            "confidence": t["confidence"],
+            "score": t["score"],
+            "reason_codes": verd.get("reason_codes", []),
+            "evidence": verd.get("evidence", {}),
+            "hashes": {
+                "html_sha256": cap.get("html_sha256"),
+                "screenshot_sha256": cap.get("screenshot_sha256"),
+                "screenshot_ref": cap.get("screenshot_ref"),
+                "favicon_mmh3": cap.get("favicon_mmh3"),
+                "favicon_sha256": cap.get("favicon_sha256"),
+            },
+            "attribution": {
+                "registered_domain": (enr.get("registration") or {}).get("domain"),
+                "registrar": (enr.get("registration") or {}).get("registrar"),
+                "registrar_abuse_email": (enr.get("registration") or {}).get("registrar_abuse_email"),
+                "hosting_network": (enr.get("hosting") or {}).get("network"),
+                "host_abuse_email": (enr.get("hosting") or {}).get("host_abuse_email"),
+                "ips": enr.get("ips") or [],
+            },
+        })
+
+    payload_to_hash = json.dumps({
+        "case_id": c["id"],
+        "opened_at": c["opened_at"],
+        "threat_hashes": [t["hashes"]["html_sha256"] for t in threat_summaries if t["hashes"]["html_sha256"]],
+        "identifiers": c["identifiers"],
+        "authorisation_letter_sha256": letter_sha,
+    }, sort_keys=True)
+    manifest_sha256 = hashlib.sha256(payload_to_hash.encode()).hexdigest()
+
+    return {
+        "dossier_id": f"HAUL16-DOSSIER-{case_id.upper()}",
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "rules_version": RULES_VERSION,
+        "manifest_sha256": manifest_sha256,
+        "legal_basis": {
+            "jurisdiction": "Ghana",
+            "statutes": [
+                "Electronic Transactions Act, 2008 (Act 772), Sections 90-95 (Intermediary Takedown & Liability Protections)",
+                "Data Protection Act, 2012 (Act 843) (Personal Data Processing for Fraud Prevention)",
+                "Securities Industry Act, 2016 (Act 929) & SEC Digital Asset Framework",
+            ],
+            "designated_agent": {
+                "entity": "HAUL16 Brand Abuse Desk",
+                "brand_id": S.watch.brand.brand_id,
+                "brand_name": S.watch.brand.display_name,
+                "official_domains": S.watch.brand.official_domains,
+                "authorisation_letter_ref": letter_ref,
+                "authorisation_letter_sha256": letter_sha,
+            },
+        },
+        "case": {
+            "id": c["id"],
+            "title": c["title"],
+            "status": c["status"],
+            "opened_at": c["opened_at"],
+            "first_detected": c.get("first_detected") or c["opened_at"],
+        },
+        "campaign_linkage": {
+            "linking_kinds_enforced": list(LINKING_KINDS),
+            "shared_identifiers": c["identifiers"],
+            "explanation": "Threats are clustered into this campaign strictly by shared unverified payment numbers, crypto wallets, or direct contact handles.",
+        },
+        "threats": threat_summaries,
+        "notices": c["notices"],
+        "clock_events": c["clock"],
+        "chain_of_custody": c["audit"],
+        "limitations": [
+            "All filings in this desk are recorded as dry-run simulations until formal transmission.",
+            "Takedown clocks and removal times are calculated from initial detection to verified removal.",
+            "Attribution data is gathered via public RFC 9083 RDAP queries and direct DNS resolution.",
+        ],
+    }
+
+
 @app.post("/api/cases/{case_id}/redraft")
 def redraft(case_id: str):
     c = S.store.case(case_id)
@@ -251,6 +348,25 @@ def inject(body: InjectIn):
     return {"threat_id": tid, "duplicate": tid is None}
 
 
+class IngestRealIn(BaseModel):
+    limit: int = Field(default=5, ge=1, le=25)
+
+
+@app.post("/api/threats/ingest-real")
+async def ingest_real(body: IngestRealIn = IngestRealIn()):
+    """Fetch real lookalikes from Certificate Transparency logs and ingest into pipeline."""
+    from engine.ingest_real import fetch_crt_lookalikes, run_ingestion
+    brand = S.watch.brand
+    targets = await fetch_crt_lookalikes(
+        brand.seed_terms,
+        brand.official_domains + brand.allowlist_domains,
+        limit=body.limit,
+        brand_id=brand.brand_id,
+    )
+    results = await run_ingestion(S.watch, targets)
+    return {"ingested_count": len(results), "targets": targets, "results": results}
+
+
 class DemoIn(BaseModel):
     variant: str = Field(pattern="^(clone|clone2|decoy)$")
 
@@ -276,6 +392,14 @@ def demo_reset():
     S.watch.attempts.clear()
     S.store.audit("operator", "demo_reset")
     return {"ok": True}
+
+
+@app.post("/api/demo/seed")
+def demo_seed():
+    """Populate the database with the demonstration scenario (mirrors Vercel demo data)."""
+    from engine.seed import seed_database
+    res = seed_database(S.store)
+    return res
 
 
 # ---- evidence ---------------------------------------------------------------

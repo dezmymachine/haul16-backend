@@ -1,0 +1,29 @@
+AUTHORISATION LETTER — BRAND PROTECTION & REGULATORY ENFORCEMENT
+
+To: Registrars, Web Hosting Providers, Content Delivery Networks, Platform Abuse Desks,
+    Telecommunications Operators, and Regulatory Authorities (NCA, CSA, SEC Ghana, Bank of Ghana)
+
+Entity: Yellow Card Ghana Limited
+Registration / Regulatory Status: Participant, Securities and Exchange Commission (SEC) Ghana
+Regulatory Sandbox for Virtual Asset Service Providers (VASPs).
+Official Domain: yellowcard.io
+
+APPOINTMENT OF DESIGNATED AGENT:
+Yellow Card Ghana Limited hereby formally appoints and designates HAUL16 (Hall 16 Brand
+Protection & Takedown Desk) as its authorized agent to detect, monitor, investigate, document,
+and enforce brand abuse, trademark infringement, malicious lookalike domains, phishing attacks,
+fraudulent cryptocurrency schemes, and unauthorized mobile money cash collection targeting
+Yellow Card and its users in the Republic of Ghana and West Africa.
+
+HAUL16 is fully empowered to submit takedown notices, request domain suspensions, seek network
+blacklisting, demand de-indexing, and log fraud complaints on behalf of Yellow Card Ghana Limited
+pursuant to:
+- Section 92 of the Electronic Transactions Act, 2008 (Act 772);
+- Section 35 of the Cybersecurity Act, 2020 (Act 1038);
+- Non-Bank Financial Institutions / Payment Systems and Services Guidelines of Ghana.
+
+Signed:
+Director of Legal, Compliance & Information Security
+Yellow Card Ghana Limited
+Accra, Republic of Ghana
+Date: 30 October 2026

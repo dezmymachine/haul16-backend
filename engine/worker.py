@@ -102,9 +102,10 @@ class Watch:
             case_id, links = self.store.assign_case(tid, self.brand.brand_id,
                                                     f"Suspected clone of {self.brand.display_name}")
             drafts = notices.draft(self.store.threat(tid), self.brand, self.brand_cfg, case_id)
-            # A fraud desk needs one report per number, not one per site that shows it.
+            # A fraud desk needs one report per number/handle, not one per site that shows it.
             existing = {(n["channel"], n["subject"]) for n in self.store.notices(case_id)}
-            drafts = [d for d in drafts if not (d["channel"].startswith("telco_")
+            dedupe_prefixes = ("telco_", "telegram_abuse", "meta_whatsapp")
+            drafts = [d for d in drafts if not (any(d["channel"].startswith(p) for p in dedupe_prefixes)
                                                 and (d["channel"], d["subject"]) in existing)]
             n = self.store.add_notices(case_id, drafts, tid)
             result.update(case_id=case_id, linked_via=[f"{l['kind']}:{l['value']}" for l in links],

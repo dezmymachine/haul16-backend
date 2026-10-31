@@ -12,7 +12,7 @@ from rapidfuzz.distance import DamerauLevenshtein
 
 from engine.normalize import skeleton, split_host, to_unicode, tokens
 
-RULES_VERSION = "2026-10-30.1"
+RULES_VERSION = "2026-10-30.2"
 
 LURE_WORDS = {
     "login", "signin", "support", "help", "helpdesk", "care", "customer", "service",
