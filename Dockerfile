@@ -9,8 +9,9 @@ WORKDIR /app
 
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
-# Chromium and its system libraries for evidence capture
-RUN uv run playwright install --with-deps chromium
+# Chromium and its system libraries for evidence capture, in a shared path so the non-root user can launch it
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN uv run playwright install --with-deps chromium && chmod -R a+rX /opt/ms-playwright
 
 COPY . .
 RUN useradd -m haul16 && chown -R haul16 /app /home/haul16
