@@ -70,7 +70,8 @@ def _is_private(host: str) -> bool:
     return False
 
 
-async def capture(url: str, allow_local: bool = False, out_dir: Path = EVIDENCE_DIR) -> Capture:
+async def capture(url: str, allow_local: bool = False, out_dir: Path = EVIDENCE_DIR, wait_until: str = "load") -> Capture:
+    """wait_until: "load" for ordinary sites. Telegram and WhatsApp pages are server-rendered but load slowly in a headless browser, so they use "domcontentloaded"."""
     cap = Capture(url=url, captured_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
     out_dir.mkdir(parents=True, exist_ok=True)
     private_cache: dict[str, bool] = {}
@@ -101,7 +102,7 @@ async def capture(url: str, allow_local: bool = False, out_dir: Path = EVIDENCE_
         page = await ctx.new_page()
         page.on("dialog", lambda d: asyncio.ensure_future(d.dismiss()))
         try:
-            resp = await page.goto(url, wait_until="load", timeout=TIMEOUT_MS)
+            resp = await page.goto(url, wait_until=wait_until, timeout=TIMEOUT_MS)
             await page.wait_for_timeout(1500)          # let client-side rendering settle
             cap.final_url = page.url
             if resp:

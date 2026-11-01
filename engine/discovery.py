@@ -89,13 +89,13 @@ async def src_ct_history(ctx: Ctx) -> list[Found]:
     errors = 0
     for term in ctx.terms[:4]:
         try:
-            res = await request(ctx.http, "GET", "https://crt.sh/", params={"q": f"%{term}%", "output": "json"}, timeout=60, retries=1)
+            res = await request(ctx.http, "GET", "https://crt.sh/", params={"q": f"%{term}%", "output": "json"}, timeout=30, retries=0)
             rows = res.json() if res.status_code == 200 and res.text.strip().startswith("[") else None
         except (UpstreamError, ValueError):
             rows = None
         if rows is None:
             errors += 1
-            continue
+            break                                  # crt.sh is down or busy: do not make the scan wait for every term
         for r in rows[:3000]:
             issued = (r.get("not_before") or "")[:10]
             if issued < cutoff:
@@ -103,7 +103,7 @@ async def src_ct_history(ctx: Ctx) -> list[Found]:
             for name in (r.get("name_value") or "").split("\n"):
                 if (h := clean_host(name)):
                     seen.setdefault(h, issued)
-    if errors == len(ctx.terms[:4]) and ctx.terms:
+    if errors and not seen:
         raise UpstreamError("crt.sh did not answer (it is often slow or busy). Try again later.")
     return [Found(h, "ct_history", note=f"certificate issued {d}") for h, d in seen.items()]
 

@@ -141,7 +141,7 @@ def health():
         queued = S.store.db.execute("SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued','running')").fetchone()["n"]
     except Exception:  # noqa: BLE001
         db_ok, queued = False, None
-    return {"ok": db_ok, "dry_run": get_settings().haul16_dry_run, "email_ready": senders.smtp_ready(), "ct_enabled": CT_ENABLED, "env": SETTINGS.haul16_env, "db": db_ok,
+    return {"ok": db_ok, "dry_run": get_settings().haul16_dry_run, "email_ready": senders.smtp_ready(), "alert_channels": {"webhook": bool(get_settings().alert_webhook_url), "email": bool(get_settings().alert_email_to and senders.smtp_ready())}, "ct_enabled": CT_ENABLED, "env": SETTINGS.haul16_env, "db": db_ok,
             "jobs_pending": queued, "embedded_worker": SETTINGS.embedded_worker,
             "collectors": {"llm": bool(SETTINGS.openai_api_key if SETTINGS.llm_provider == "openai" else SETTINGS.anthropic_api_key),
                            "firecrawl": bool(SETTINGS.firecrawl_api_key), "apify": bool(SETTINGS.apify_token and SETTINGS.apify_linkedin_actor),

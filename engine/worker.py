@@ -131,7 +131,7 @@ class Watch:
         urls = capture_urls(host) if social else ([url] if url else [f"https://{host}/", f"http://{host}/"])
         cap = None
         for u in urls:
-            cap = await capture(u, allow_local=allow_local)
+            cap = await capture(u, allow_local=allow_local, wait_until="domcontentloaded" if social else "load")
             if cap.html_sha256:
                 break
         enr: dict = {"host": host, "platform": "telegram" if host.startswith("t.me/") else "whatsapp"} if social else {}
