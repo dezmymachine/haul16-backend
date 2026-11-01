@@ -109,7 +109,8 @@ def test_activate_switches_the_detection_brand(client):
     b = client.post("/api/brands", json={"display_name": "Acme Pay", "website": "acme.test"}).json()
     assert client.post(f"/api/brands/{b['id']}/activate").status_code == 409                # profile not built yet
     BrandRepo(api.S.store).update(b["id"], status="ready")
-    assert client.post(f"/api/brands/{b['id']}/activate").json() == {"active": b["id"]}
+    act = client.post(f"/api/brands/{b['id']}/activate").json()
+    assert act["active"] == b["id"] and act["sweep"]["status"] == "running"                   # protection starts a look-alike scan
     assert client.get("/api/brand").json()["display_name"] == "Acme Pay"
     assert api.S.watch.matcher.brand.brand_id == b["id"] and api.S.pipe.matcher is api.S.watch.matcher
     assert [x["id"] for x in client.get("/api/brands").json() if x["is_active"]] == [b["id"]]
@@ -119,3 +120,85 @@ def test_demo_routes_are_off_in_production(client, monkeypatch):
     monkeypatch.setattr(api.SETTINGS, "haul16_env", "prod")
     assert client.post("/api/demo/clone", json={"variant": "clone"}).status_code == 404
     assert client.post("/api/demo/reset").status_code == 404
+
+
+def test_starts_with_no_brand_and_matches_nothing(db_url, monkeypatch):
+    from engine.store import Store
+    s = Store(db_url, migrate_schema=False)
+    s.db.execute("TRUNCATE " + ", ".join(TABLES) + " RESTART IDENTITY")
+    s.db.close()
+    monkeypatch.setattr(api.SETTINGS, "seed_demo_brand", False)
+    from engine.settings import get_settings
+    monkeypatch.setenv("SEED_DEMO_BRAND", "false")
+    get_settings.cache_clear()
+    with TestClient(api.app) as c:
+        assert c.get("/api/brands").json() == []
+        assert c.get("/api/stats").json()["counts"]["threats"] == 0
+        assert api.S.watch.matcher.match("nkwaex-support.com") is None          # nothing is watched until a brand is activated
+    get_settings.cache_clear()
+
+
+def test_filing_is_locked_until_ownership_and_letter(client):
+    nid, case_id = seed_notice()
+    client.post(f"/api/notices/{nid}/approve", json={"approver": "Ama Mensah"})
+    repo = BrandRepo(api.S.store)
+    repo.update("brand_demo", ownership_status="unverified")
+    r = client.post(f"/api/notices/{nid}/file")
+    assert r.status_code == 409 and "control the brand's domain" in r.json()["detail"]
+    repo.update("brand_demo", ownership_status="verified", authorisation_letter_sha256=None)
+    r = client.post(f"/api/notices/{nid}/file")
+    assert r.status_code == 409 and "authorisation letter" in r.json()["detail"]
+    repo.update("brand_demo", authorisation_letter_sha256="a" * 64)
+    assert client.post(f"/api/notices/{nid}/file").json()["status"] == "filed_dry_run"
+
+
+def test_delete_brand_removes_everything_for_it(client):
+    seed_notice()
+    b = client.post("/api/brands", json={"display_name": "Temp Co", "website": "temp.test"}).json()
+    repo = BrandRepo(api.S.store)
+    repo.upsert_fact(b["id"], "email", "a@temp.test", collector="website", origin="official")
+    assert client.delete(f"/api/brands/{b['id']}").json() == {"deleted": b["id"]}
+    assert client.get(f"/api/brands/{b['id']}").status_code == 404
+    assert repo.facts(b["id"]) == []
+    assert client.delete(f"/api/brands/{b['id']}").status_code == 404
+    assert len(client.get("/api/notices").json()) == 1                      # the other brand's data is untouched
+
+
+def test_deleting_the_watched_brand_stops_detection(client):
+    b = client.post("/api/brands", json={"display_name": "Acme Pay", "website": "acmepay.test"}).json()
+    BrandRepo(api.S.store).update(b["id"], status="ready")
+    client.post(f"/api/brands/{b['id']}/activate")
+    assert api.S.watch.brand.brand_id == b["id"]
+    client.delete(f"/api/brands/{b['id']}")
+    assert api.S.watch.brand.brand_id == "__none__" and api.S.watch.matcher.match("acmepay-login.com") is None
+
+
+def test_setup_state_walks_the_user_through_the_next_step(client):
+    b = client.post("/api/brands", json={"display_name": "Acme Pay", "website": "acmepay.test"}).json()
+    bid = b["id"]
+    s = client.get(f"/api/brands/{bid}/setup").json()
+    assert s["next_action"]["key"] == "wait_profile" and s["step"] == 2 and not s["complete"]
+    repo = BrandRepo(api.S.store)
+    repo.update(bid, status="ready")
+    f = repo.upsert_fact(bid, "phone", "0241112223", collector="website", origin="official")
+    s = client.get(f"/api/brands/{bid}/setup").json()
+    assert s["next_action"]["key"] == "review_facts" and s["next_action"]["count"] == 1 and s["steps"]["review"] == {"done": False, "count": 1}
+    client.post(f"/api/brands/{bid}/facts/{f['id']}/confirm")
+    assert client.get(f"/api/brands/{bid}/setup").json()["next_action"]["key"] == "start_protection"
+    client.post(f"/api/brands/{bid}/activate")
+    s = client.get(f"/api/brands/{bid}/setup").json()
+    assert s["complete"] and s["step"] == 3 and s["next_action"]["key"] == "prove_ownership"    # protecting, but filing still locked
+    repo.update(bid, ownership_status="verified", authorisation_letter_sha256="b" * 64)
+    s = client.get(f"/api/brands/{bid}/setup").json()
+    assert s["next_action"]["key"] == "all_clear" and s["step"] == 4 and s["sweep"]["status"] == "running"
+
+
+def test_sweep_route_needs_protection_first(client):
+    bid = client.post("/api/brands", json={"display_name": "Acme Pay", "website": "acmepay.test"}).json()["id"]
+    assert client.post(f"/api/brands/{bid}/sweep").status_code == 409          # profile not built
+    BrandRepo(api.S.store).update(bid, status="ready")
+    r = client.post(f"/api/brands/{bid}/sweep")
+    assert r.status_code == 409 and "Start protection" in r.json()["detail"]
+    client.post(f"/api/brands/{bid}/activate")
+    assert client.get(f"/api/brands/{bid}/sweep/status").json()["status"] == "running"
+    assert client.post(f"/api/brands/{bid}/sweep").json()["status"] == "running"   # no duplicate job

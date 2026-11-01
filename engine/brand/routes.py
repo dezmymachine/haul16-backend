@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from engine import jobs
 from engine.brand import verify
-from engine.brand.loader import brand_from_db
+from engine.brand.loader import NO_BRAND, brand_from_db
 from engine.brand.repo import BrandRepo
 from engine.settings import ROOT
 
@@ -148,6 +148,81 @@ def upload_letter(brand_id: str, body: LetterIn):
     return {"ref": safe, "sha256": sha, "bytes": len(data)}
 
 
+def _sweep(brand_id: str) -> dict:
+    j = jobs.latest(STATE.store, "lookalike_sweep", brand_id)
+    if not j:
+        return {"status": "none"}
+    res = j["result"] or {}
+    return {"job_status": j["status"], "status": "done" if j["status"] == "done" else ("failed" if j["status"] == "failed" else "running"),
+            "error": j["last_error"], "updated_at": j["updated_at"], "phase": res.get("phase", "queued"), "generated": res.get("generated", 0),
+            "checked": res.get("checked", 0), "registered": res.get("registered", 0), "queued": res.get("queued", 0),
+            "skipped_known": res.get("skipped_known", 0)}
+
+
+@router.post("/{brand_id}/sweep")
+def run_sweep_route(brand_id: str):
+    b = _need(brand_id)
+    if b["status"] != "ready":
+        raise HTTPException(409, "Build the brand's profile first")
+    if not b["is_active"]:
+        raise HTTPException(409, "Start protection first. Detection must be watching this brand.")
+    cur = _sweep(brand_id)
+    if cur["status"] == "running":
+        return cur
+    jobs.enqueue(STATE.store, "lookalike_sweep", brand_id, {}, max_attempts=1)
+    return _sweep(brand_id)
+
+
+@router.get("/{brand_id}/sweep/status")
+def sweep_status(brand_id: str):
+    _need(brand_id)
+    return _sweep(brand_id)
+
+
+@router.get("/{brand_id}/setup")
+def setup_state(brand_id: str):
+    """Where this brand is in setup, and the one thing to do next. The wizard and Home both read this so they always agree."""
+    b = _need(brand_id)
+    r = repo()
+    facts = r.facts(brand_id)
+    undecided = [f for f in facts if f["review_status"] == "pending" and (f["needs_confirmation"] or f["verification"] == "conflicting")]
+    ready, running = b["status"] == "ready", b["status"] == "profiling"
+    verified, letter, active = b["ownership_status"] == "verified", bool(b["authorisation_letter_sha256"]), bool(b["is_active"])
+    awaiting = len(STATE.store.all_notices(brand_id, "drafted"))
+    approved = len(STATE.store.all_notices(brand_id, "approved"))
+    steps = {"brand": {"done": True}, "profile": {"done": ready, "running": running},
+             "review": {"done": not undecided, "count": len(undecided)}, "ownership": {"done": verified}, "letter": {"done": letter},
+             "protection": {"done": active}}
+    wizard_step = 2 if not (ready and not undecided) else 3 if not (verified and letter) else 4
+    if not ready:
+        nxt = {"key": "wait_profile", "title": "Reading your brand's public footprint", "detail": "This takes about a minute. You can leave this page.", "href": "/setup?step=2"}
+    elif undecided:
+        nxt = {"key": "review_facts", "title": f"Confirm {len(undecided)} detail{'s' if len(undecided) != 1 else ''} we found", "detail": "Phone numbers, accounts and wallets are only used once you confirm them.", "href": "/setup?step=2", "count": len(undecided)}
+    elif not active:
+        nxt = {"key": "start_protection", "title": "Start protecting your brand", "detail": "HAUL16 will watch for look-alike sites and scan for ones that already exist.", "href": "/setup?step=4"}
+    elif awaiting:
+        nxt = {"key": "review_notices", "title": f"Approve {awaiting} takedown notice{'s' if awaiting != 1 else ''}", "detail": "Each one needs a person to approve it before it can be filed.", "href": "/approvals", "count": awaiting}
+    elif approved and verified and letter:
+        nxt = {"key": "file_notices", "title": f"File {approved} approved notice{'s' if approved != 1 else ''}", "detail": "Filing is a dry run for now: nothing is sent, and the takedown clock starts.", "href": "/approvals?status=approved", "count": approved}
+    elif approved or not (verified and letter):
+        nxt = {"key": "prove_ownership", "title": "Prove it's your brand", "detail": "Required before any notice can be filed: verify your domain and add the signed authorisation letter.", "href": "/setup?step=3"}
+    else:
+        nxt = {"key": "all_clear", "title": "All clear", "detail": "Nothing needs you right now. HAUL16 keeps watching.", "href": "/home"}
+    return {"brand_id": brand_id, "step": wizard_step, "complete": active, "steps": steps, "next_action": nxt, "sweep": _sweep(brand_id),
+            "counts": {"threats": len(STATE.store.threats(brand_id, limit=100000)), "awaiting": awaiting, "approved": approved}}
+
+
+@router.delete("/{brand_id}")
+def delete_brand(brand_id: str):
+    _need(brand_id)
+    was_active = STATE.watch.brand.brand_id == brand_id
+    repo().delete(brand_id)
+    if was_active:
+        STATE.watch.set_brand(NO_BRAND, {})
+        STATE.pipe.matcher = STATE.watch.matcher
+    return {"deleted": brand_id}
+
+
 @router.post("/{brand_id}/activate")
 def activate(brand_id: str):
     """Point the live detection pipeline (CT matcher and capture workers) at this brand."""
@@ -159,4 +234,6 @@ def activate(brand_id: str):
     STATE.pipe.matcher = STATE.watch.matcher
     STATE.store.db.execute("UPDATE brands SET is_active=(id=?)", (brand_id,))
     STATE.store.audit("operator", "brand_activated", brand_id)
-    return {"active": brand_id}
+    if _sweep(brand_id)["status"] != "running":        # protection starts with a look-alike scan so there is something to review
+        jobs.enqueue(STATE.store, "lookalike_sweep", brand_id, {}, max_attempts=1)
+    return {"active": brand_id, "sweep": _sweep(brand_id)}

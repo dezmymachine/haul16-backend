@@ -3,6 +3,10 @@ from engine.brand.repo import BrandRepo
 from engine.matcher import Brand
 
 
+# The pipeline runs with this until a real brand is activated: no seed terms, so nothing matches and nothing is captured.
+NO_BRAND = Brand(brand_id="__none__", display_name="", seed_terms=[], official_domains=[])
+
+
 def brand_from_db(repo: BrandRepo, brand_id: str) -> tuple[Brand, dict]:
     d = repo.detection_inputs(brand_id)
     b = d["brand"]

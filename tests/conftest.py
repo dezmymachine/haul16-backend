@@ -8,6 +8,7 @@ os.environ.setdefault("TEST_DATABASE_URL", "postgresql://haul16:haul16@127.0.0.1
 os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
 os.environ["HAUL16_CT"] = "0"
 os.environ["EMBEDDED_WORKER"] = "false"
+os.environ["SEED_DEMO_BRAND"] = "true"          # API tests use the fictional demo brand; one test turns it off
 for _k in ("OPENAI_API_KEY", "FIRECRAWL_API_KEY", "APIFY_TOKEN", "SEARCH_API_KEY", "URLSCAN_API_KEY"):
     os.environ[_k] = ""          # tests never call real vendors; collectors without a key skip
 

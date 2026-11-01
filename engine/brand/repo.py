@@ -87,6 +87,21 @@ class BrandRepo:
         vals = [json.dumps(v) if k in ("seed_terms", "inputs") else v for k, v in fields.items()]
         self.db.execute(f"UPDATE brands SET {cols}, updated_at=? WHERE id=?", (*vals, now(), brand_id))
 
+    def delete(self, brand_id: str) -> None:
+        """Remove a brand and everything collected or detected for it (used to clear test brands). The audit log is kept."""
+        q = self.db.execute
+        case_ids = [r["id"] for r in q("SELECT id FROM cases WHERE brand_id=?", (brand_id,))]
+        thr_ids = [r["id"] for r in q("SELECT id FROM threats WHERE brand_id=?", (brand_id,))]
+        for cid in case_ids:
+            q("DELETE FROM notices WHERE case_id=?", (cid,))
+            q("DELETE FROM clock_events WHERE case_id=?", (cid,))
+        for tid in thr_ids:
+            q("DELETE FROM identifiers WHERE threat_id=?", (tid,))
+        for t in ("threats", "cases", "brand_facts", "brand_assets", "brand_people", "brand_profile_versions", "signals", "jobs", "llm_calls"):
+            q(f"DELETE FROM {t} WHERE brand_id=?", (brand_id,))
+        q("DELETE FROM brands WHERE id=?", (brand_id,))
+        self.store.audit("operator", "brand_deleted", brand_id)
+
     # ---- facts ---------------------------------------------------------------
 
     def upsert_fact(self, brand_id: str, kind: str, value: str, *, collector: str, origin: str, source_url: str | None = None,

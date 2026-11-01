@@ -22,10 +22,10 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from engine import ct_poll, jobs, notices
+from engine import auth, ct_poll, jobs, notices
 from engine.brand import routes as brand_routes
 from engine.brand.import_yaml import import_yaml
-from engine.brand.loader import brand_from_db
+from engine.brand.loader import NO_BRAND, brand_from_db
 from engine.brand.repo import BrandRepo
 from engine.worker_main import handlers as job_handlers
 from engine.pipeline import Pipeline
@@ -89,13 +89,15 @@ async def stats_ticker() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    s = get_settings()
+    if s.is_prod and not (s.auth_owner_password and s.session_secret):
+        raise RuntimeError("Production needs AUTH_OWNER_PASSWORD and SESSION_SECRET (sign-in must be on)")
     S.store = Store()
     repo = BrandRepo(S.store)
-    if not repo.list_all() or not SETTINGS.is_prod:
-        import_yaml(S.store)                       # the fictional demo brand (idempotent); production seeds it only when no brand exists yet
-    row = S.store.db.execute("SELECT id FROM brands WHERE is_active LIMIT 1").fetchone() or S.store.db.execute(
-        "SELECT id FROM brands WHERE status='ready' ORDER BY created_at LIMIT 1").fetchone()
-    brand, cfg = brand_from_db(repo, row["id"])
+    if s.seed_demo_brand:
+        import_yaml(S.store)                       # the fictional demo brand, development only (idempotent)
+    row = S.store.db.execute("SELECT id FROM brands WHERE is_active LIMIT 1").fetchone()
+    brand, cfg = brand_from_db(repo, row["id"]) if row else (NO_BRAND, {})   # no brand yet: nothing matches until one is activated
     S.watch = Watch(brand, S.store, brand_cfg=cfg, workers=2)
     S.pipe = Pipeline(S.watch.matcher, ROOT / "data" / "hits.jsonl", on_hit=S.watch.on_hit)
     S.lag, S.started = {}, time.monotonic()
@@ -104,7 +106,7 @@ async def lifespan(app: FastAPI):
     tasks = [asyncio.create_task(S.watch.capture_worker()) for _ in range(S.watch.workers)]
     tasks.append(asyncio.create_task(stats_ticker()))
     if SETTINGS.embedded_worker:
-        tasks.append(asyncio.create_task(jobs.run_worker(S.store, job_handlers(S.store))))
+        tasks.append(asyncio.create_task(jobs.run_worker(S.store, job_handlers(S.store, S.watch))))
     if CT_ENABLED:
         tasks.append(asyncio.create_task(ct_loop()))
     yield
@@ -113,8 +115,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="HAUL16", lifespan=lifespan)
+app.add_middleware(auth.AuthMiddleware)       # added first so CORS (added next) wraps it and 401s still carry CORS headers
 app.add_middleware(CORSMiddleware, allow_origins=SETTINGS.origins,
                    allow_methods=["*"], allow_headers=["*"])
+app.include_router(auth.router)
 app.include_router(brand_routes.router)
 if not SETTINGS.is_prod:                          # demo fixtures and demo routes are development-only
     app.mount("/demo-sites", StaticFiles(directory=ROOT / "fixtures" / "sites", html=True), name="demo-sites")
@@ -216,7 +220,7 @@ def list_notices(status: str | None = None, b: str = Depends(bid)):
 
 
 class Approve(BaseModel):
-    approver: str = Field(min_length=2, max_length=80)
+    approver: str | None = Field(default=None, max_length=80)     # ignored when signed in: the session name is used
 
 
 class Reject(Approve):
@@ -235,21 +239,31 @@ def _notice(nid: str) -> dict:
     return n
 
 
+def _who(request: Request, body: Approve) -> str:
+    """The approver is the signed-in person. Only when sign-in is off does the request name them."""
+    who = auth.current_user_name(request) or (body.approver or "").strip()
+    if len(who) < 2:
+        raise HTTPException(422, "Enter your name so the decision can be recorded against you")
+    return who
+
+
 @app.post("/api/notices/{nid}/approve")
-def approve(nid: str, body: Approve):
+def approve(nid: str, body: Approve, request: Request):
     n = _notice(nid)
+    who = _who(request, body)
     if n["status"] != "drafted":
         raise HTTPException(409, f"Notice is {n['status']}, only drafts can be approved")
-    S.store.approve_notice(nid, body.approver.strip())
+    S.store.approve_notice(nid, who)
     return S.store.notice(nid)
 
 
 @app.post("/api/notices/{nid}/reject")
-def reject(nid: str, body: Reject):
+def reject(nid: str, body: Reject, request: Request):
     n = _notice(nid)
+    who = _who(request, body)
     if n["status"] not in ("drafted", "approved"):
         raise HTTPException(409, f"Notice is {n['status']}")
-    S.store.reject_notice(nid, body.approver.strip(), body.reason)
+    S.store.reject_notice(nid, who, body.reason)
     return S.store.notice(nid)
 
 
@@ -258,6 +272,11 @@ def file_notice(nid: str):
     n = _notice(nid)
     if n["status"] != "approved":
         raise HTTPException(409, "A person must approve this notice before it is filed")
+    brand = BrandRepo(S.store).get(S.store.db.execute("SELECT brand_id FROM cases WHERE id=?", (n["case_id"],)).fetchone()["brand_id"])
+    if not brand or brand["ownership_status"] != "verified":
+        raise HTTPException(409, "Prove you control the brand's domain before filing (Brand, then Verify and letter)")
+    if not brand["authorisation_letter_sha256"]:
+        raise HTTPException(409, "Upload the signed authorisation letter before filing (Brand, then Verify and letter)")
     S.store.file_notice(nid, n["approved_by"])
     S.watch.publish({"type": "filed", "notice_id": nid, "case_id": n["case_id"], "channel": n["channel"]})
     return S.store.notice(nid)

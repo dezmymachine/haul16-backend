@@ -13,6 +13,12 @@ class Settings(BaseSettings):
     haul16_env: str = "dev"                   # dev | prod (prod turns demo routes off)
     haul16_port: int = 8000
     haul16_ct: bool = True                    # follow CT logs inside the API process
+    seed_demo_brand: bool = False             # add the fictional demo brand on start (development only)
+    # Sign-in: one owner account. Auth is ON whenever a password is set. Production requires both password and secret.
+    auth_owner_email: str = "owner@haul16.local"
+    auth_owner_name: str | None = None
+    auth_owner_password: str | None = None
+    session_secret: str | None = None
     embedded_worker: bool = True              # run the job worker inside the API process (set false when a separate worker service runs)
     haul16_dry_run: bool = True               # nothing is ever sent while true
     frontend_origins: str = "http://localhost:5173,http://127.0.0.1:5173"

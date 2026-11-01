@@ -90,6 +90,21 @@ Safety built in:
 - **Ownership:** `POST /api/brands/{id}/verify` checks a DNS TXT record (`_haul16-verify.<domain>` or the domain itself) containing the brand's token. No verified owner, no filings (to be enforced on the file route in the auth milestone).
 - **Kill switches:** insert `(collector, FALSE)` into `source_toggles` to disable a collector without a deploy.
 
+### First-run flow and sign-in (Milestone 1.5)
+- **Sign-in:** one owner account from `AUTH_OWNER_EMAIL` / `AUTH_OWNER_PASSWORD`. Auth is on whenever a password is set. `POST /api/auth/login` sets an HMAC-signed `HttpOnly`, `SameSite=Lax` cookie;
+  a pure ASGI middleware (`engine/auth.py`, so the SSE stream is not buffered) returns 401 for every `/api/*` route except `/api/health` and `/api/auth/*`. Logins are rate-limited (5 a minute per IP).
+  The **approver recorded on a notice is the signed-in person**, taken from the session, never from the request body (the body field is only honoured when sign-in is off). `HAUL16_ENV=prod` without
+  `AUTH_OWNER_PASSWORD` and `SESSION_SECRET` refuses to start. Multi-user SSO and roles are Milestone 4.
+- **No demo brand:** the API starts with no brand (`NO_BRAND`: no seed terms, so nothing matches or is captured) until a real brand is activated. Set `SEED_DEMO_BRAND=true` (development only) or run
+  `uv run python -m engine.brand.import_yaml` for the fictional demo brand. `DELETE /api/brands/{id}` removes a brand and everything collected or detected for it.
+- **Filing gate:** `POST /api/notices/{id}/file` returns 409 until the brand's domain ownership is verified **and** a signed authorisation letter is on file.
+- **Look-alike sweep (`engine/sweep.py`):** `generate_candidates()` builds typo (omission, repetition, transposition, keyboard replacement), homoglyph (Unicode as punycode, `rn`/`m`, `0`/`o`), hyphen, lure-word
+  and TLD variants of the brand's domain (cap 600, never the brand's own or allow-listed domains). `run_sweep()` resolves them over DNS (no key), keeps those that exist **and** that the matcher flags, and injects
+  the strongest 40 into the normal capture and scoring pipeline (`Watch.inject`, source `lookalike_sweep`), so cases and drafted notices work unchanged. `POST /api/brands/{id}/sweep` and
+  `GET /api/brands/{id}/sweep/status`; activating a brand queues the first sweep. It runs as a job in the API process (it needs the `Watch` queue), so keep `EMBEDDED_WORKER=true` on the API service.
+- **Setup state:** `GET /api/brands/{id}/setup` returns `{step, complete, steps, next_action, sweep, counts}` computed server-side, so the setup wizard and the Home page always agree on the one next thing to do.
+  Order of `next_action`: profile building, details to confirm, start protection, notices to approve, notices to file (or prove ownership first), prove ownership, all clear.
+
 ### Brand API
 | Method | Path | |
 |---|---|---|
@@ -98,6 +113,10 @@ Safety built in:
 | POST | `/api/brands/{id}/profile/run` | queue profiling (no duplicate while one is queued/running) |
 | GET | `/api/brands/{id}/profile` | facts grouped by kind, people, assets, version summary, `needs_review` and conflict ids |
 | GET | `/api/brands/{id}/profile/status` | job progress per step |
+| GET | `/api/brands/{id}/setup` | setup step and the single next action (see above) |
+| POST/GET | `/api/brands/{id}/sweep`, `/sweep/status` | run and read the look-alike domain sweep |
+| DELETE | `/api/brands/{id}` | remove a brand and all its data |
+| POST/GET | `/api/auth/login`, `/logout`, `/me` | sign-in (see above) |
 | POST | `/api/brands/{id}/verify` | check the DNS ownership record |
 | POST | `/api/brands/{id}/facts/{fact_id}/confirm` or `/reject` | human review |
 | POST | `/api/brands/{id}/letter` | `{filename, content_base64}`; stores the SHA-256 used in notices |

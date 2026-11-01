@@ -9,7 +9,7 @@ from engine.brand.profiler import run_profile
 from engine.store import Store
 
 
-def handlers(store: Store) -> dict:
+def handlers(store: Store, watch=None) -> dict:
     async def brand_profile(job: dict) -> dict:
         def progress(state: dict) -> None:
             store.db.execute("UPDATE jobs SET result=? WHERE id=?", (__import__("json").dumps(state), job["id"]))
@@ -20,7 +20,16 @@ def handlers(store: Store) -> dict:
             row = store.db.execute("SELECT active_version FROM brands WHERE id=?", (job["brand_id"],)).fetchone()
             store.db.execute("UPDATE brands SET status=? WHERE id=?", ("ready" if row and row["active_version"] else "draft", job["brand_id"]))
             raise
-    return {"brand_profile": brand_profile}
+    out = {"brand_profile": brand_profile}
+    if watch is not None:        # the sweep feeds the live pipeline, so it runs where the Watch queue lives (the API process)
+        from engine.sweep import run_sweep
+
+        async def lookalike_sweep(job: dict) -> dict:
+            def progress(state: dict) -> None:
+                store.db.execute("UPDATE jobs SET result=? WHERE id=?", (__import__("json").dumps(state), job["id"]))
+            return await run_sweep(store, watch, job["brand_id"], progress)
+        out["lookalike_sweep"] = lookalike_sweep
+    return out
 
 
 async def main() -> None:
