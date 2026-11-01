@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from engine import alerts, auth, ct_poll, discovery, jobs, liveness, notices, pack, patrol, senders
+from engine.clients import browserbase
 from engine.brand import routes as brand_routes
 from engine.brand.import_yaml import import_yaml
 from engine.brand.loader import NO_BRAND, brand_from_db
@@ -143,9 +144,9 @@ def health():
         db_ok, queued = False, None
     return {"ok": db_ok, "dry_run": get_settings().haul16_dry_run, "email_ready": senders.smtp_ready(), "alert_channels": {"webhook": bool(get_settings().alert_webhook_url), "email": bool(get_settings().alert_email_to and senders.smtp_ready())}, "ct_enabled": CT_ENABLED, "env": SETTINGS.haul16_env, "db": db_ok,
             "jobs_pending": queued, "embedded_worker": SETTINGS.embedded_worker,
-            "collectors": {"llm": bool(SETTINGS.openai_api_key if SETTINGS.llm_provider == "openai" else SETTINGS.anthropic_api_key),
-                           "firecrawl": bool(SETTINGS.firecrawl_api_key), "apify": bool(SETTINGS.apify_token and SETTINGS.apify_linkedin_actor),
-                           "search": bool(SETTINGS.search_api_key), "urlscan": bool(SETTINGS.urlscan_api_key)}}
+            "collectors": {"llm": bool(SETTINGS.gemini_api_key),
+                           "firecrawl": bool(SETTINGS.firecrawl_api_key), "browserbase": browserbase.configured(), "apify": bool(SETTINGS.apify_token and SETTINGS.apify_linkedin_actor),
+                           "search": SETTINGS.search_ready, "urlscan": bool(SETTINGS.urlscan_api_key)}}
 
 
 # ---- alerts and settings ------------------------------------------------------

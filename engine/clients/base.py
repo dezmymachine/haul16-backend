@@ -41,7 +41,7 @@ ALLOW_PRIVATE = False   # tests and local fixtures only
 
 async def _guard(request: httpx.Request) -> None:
     """Refuse requests to private/internal addresses, on the first hop and on every redirect (SSRF)."""
-    if ALLOW_PRIVATE or request.url.host in ("t.me",):
+    if ALLOW_PRIVATE or request.url.host in ("t.me", "crt.name"):      # fixed vendor hosts, never taken from user input (crt.name also publishes an AAAA of ::1)
         return
     from engine.capture import _is_private
     if await asyncio.to_thread(_is_private, request.url.host):

@@ -4,8 +4,10 @@ import functools
 import http.server
 import io
 import json
+
 import threading
 
+import httpx
 import pytest
 from PIL import Image
 
@@ -66,7 +68,7 @@ def test_profile_collects_sourced_facts_and_skips_missing_keys(store, site):
     steps = result["steps"]
     assert steps["inputs"]["status"] == "ok" and steps["website"]["status"] == "ok" and steps["assets"]["status"] == "ok"
     assert steps["website"]["pages"] >= 3
-    for skipped in ("dns", "rdap", "linkedin", "news", "dossier"):
+    for skipped in ("dns", "rdap", "subdomains", "linkedin", "news", "dossier"):
         assert steps[skipped]["status"] == "skipped", (skipped, steps[skipped])
     assert repo.get(brand["id"])["status"] == "ready" and result["version"] == 1
 
@@ -152,7 +154,7 @@ def test_dossier_drops_uncited_and_hallucinated_items(monkeypatch):
         return json.dumps(reply), {}
 
     monkeypatch.setattr(LLM, "_chat", fake_chat)
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     from engine.settings import get_settings
     get_settings.cache_clear()
     import httpx
@@ -166,3 +168,124 @@ def test_dossier_drops_uncited_and_hallucinated_items(monkeypatch):
     assert [i.value for i in out.legal_names] == ["Acme Pay Limited"]
     assert [i.value for i in out.registration_numbers] == ["CS123456"]
     assert [p.name for p in out.leadership] == ["Efua Asante"]
+
+
+def test_subdomains_collector_stores_one_fact_per_domain(store, monkeypatch):
+    import httpx
+
+    from engine.brand import profiler
+    from engine.clients import crtname
+    repo = BrandRepo(store)
+    brand = repo.create("Acme Pay", "https://acme-pay.com", None)
+
+    async def fake(client, apex):
+        return [f"login.{apex}", f"api.{apex}"]
+    monkeypatch.setattr(crtname, "subdomains", fake)
+
+    async def go():
+        async with httpx.AsyncClient() as c:
+            ctx = profiler.Ctx(store, repo, brand, c, 1, domain="acme-pay.com")
+            return await profiler.c_subdomains(ctx)
+    out = asyncio.run(go())
+    assert out == {"domains": 1, "subdomains": 2}
+    f = repo.facts(brand["id"], "subdomains")[0]
+    assert f["value"] == "acme-pay.com" and f["data"]["hosts"] == ["login.acme-pay.com", "api.acme-pay.com"] and f["verification"] == "single_source"
+    assert f["source_url"] == "https://crt.name/v1/search?apex=acme-pay.com" and not f["needs_confirmation"]
+
+
+@pytest.fixture()
+def fc_key():
+    """Firecrawl as the search provider for one test, restored afterwards so no other test sees the key through the settings cache."""
+    import os
+
+    from engine.settings import get_settings
+    names = ("FIRECRAWL_API_KEY", "SEARCH_PROVIDER")
+    old = {k: os.environ.get(k) for k in names}
+    os.environ["FIRECRAWL_API_KEY"], os.environ["SEARCH_PROVIDER"] = "fc-test", "firecrawl"
+    get_settings.cache_clear()
+    yield
+    for k, v in old.items():
+        os.environ[k] = v or ""
+    get_settings.cache_clear()
+
+
+def _linkedin_ctx(store, http, website="https://acme-pay.com", linkedin="https://www.linkedin.com/company/acme-pay", domain="acme-pay.com"):
+    from engine.brand import profiler
+    repo = BrandRepo(store)
+    brand = repo.create("Acme Pay", website, linkedin)
+    return repo, brand, profiler.Ctx(store, repo, repo.get(brand["id"]), http, 1, domain=domain)
+
+
+def _fc_handler(enrichment: bool, seen: list):
+    def handler(req):
+        body = json.loads(req.read())
+        seen.append((req.url.path, body))
+        if req.url.path == "/v2/scrape":
+            if not enrichment:
+                return httpx.Response(403, json={"code": "THIRD_PARTY_DATA_ENRICHMENT_NOT_ENABLED"})
+            return httpx.Response(200, json={"data": {"markdown": "# Acme", "json": {"name": "Acme Pay", "industry": "Fintech", "employee_count": "51-200", "website": "https://www.acme-pay.com/"}}})
+        return httpx.Response(200, json={"data": {"web": [
+            {"title": "Acme Pay | LinkedIn", "url": "https://gh.linkedin.com/company/acme-pay?trk=x", "description": "Mobile money for Ghana."},
+            {"title": "Acme Pay Fans | LinkedIn", "url": "https://www.linkedin.com/company/acme-pay-fans", "description": "other"}]}})
+    return handler
+
+
+def test_linkedin_uses_firecrawl_enrichment_when_enabled(store, fc_key):
+    from engine.brand import profiler
+    seen = []
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_fc_handler(True, seen))) as c:
+            repo, brand, ctx = _linkedin_ctx(store, c)
+            return repo, brand, await profiler.c_linkedin(ctx)
+    repo, brand, out = asyncio.run(go())
+    assert out["via"] == "enrichment" and out["profiles"] == 1 and [p for p, _ in seen] == ["/v2/scrape"]
+    f = repo.facts(brand["id"], "linkedin_profile")[0]
+    assert f["data"]["industry"] == "Fintech" and f["data"]["employees"] == "51-200" and f["collector"] == "firecrawl:linkedin"
+    assert any(x["data"].get("platform") == "linkedin" and x["verification"] for x in repo.facts(brand["id"], "social"))   # site matches: corroborating fact
+
+
+def test_linkedin_falls_back_to_search_when_enrichment_is_off(store, fc_key):
+    from engine.brand import profiler
+    seen = []
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_fc_handler(False, seen))) as c:
+            repo, brand, ctx = _linkedin_ctx(store, c)
+            return repo, brand, await profiler.c_linkedin(ctx)
+    repo, brand, out = asyncio.run(go())
+    assert out["via"] == "search" and "enrichment is not switched on" in out["note"]
+    f = repo.facts(brand["id"], "linkedin_profile")[0]
+    assert f["label"] == "Acme Pay" and f["data"]["description"] == "Mobile money for Ghana." and f["collector"] == "firecrawl:search"
+
+
+def test_linkedin_falls_back_to_search_when_enrichment_errors(store, fc_key):
+    from engine.brand import profiler
+
+    def handler(req):
+        if req.url.path == "/v2/scrape":
+            return httpx.Response(500, json={"success": False, "code": "SCRAPE_ALL_ENGINES_FAILED", "error": "All scraping engines failed"})
+        return _fc_handler(True, [])(req)
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+            repo, brand, ctx = _linkedin_ctx(store, c)
+            return repo, brand, await profiler.c_linkedin(ctx)
+    repo, brand, out = asyncio.run(go())
+    assert out["via"] == "search" and "SCRAPE_ALL_ENGINES_FAILED" in out["note"] and out["profiles"] == 1
+    assert repo.facts(brand["id"], "linkedin_profile")[0]["collector"] == "firecrawl:search"
+
+
+def test_linkedin_without_a_link_only_suggests_a_page_for_confirmation(store, fc_key):
+    from engine.brand import profiler
+    seen = []
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_fc_handler(True, seen))) as c:
+            repo, brand, ctx = _linkedin_ctx(store, c, linkedin=None)
+            return repo, brand, await profiler.c_linkedin(ctx)
+    repo, brand, out = asyncio.run(go())
+    assert out == {"profiles": 0, "candidates": 1, "via": "search"} and all(p != "/v2/scrape" for p, _ in seen)   # no enrichment credits on a guess
+    s = [x for x in repo.facts(brand["id"], "social") if x["data"].get("platform") == "linkedin"][0]
+    assert s["value"] == "https://www.linkedin.com/company/acme-pay" and s["needs_confirmation"] and s["review_status"] == "pending"
+    assert not repo.facts(brand["id"], "linkedin_profile")

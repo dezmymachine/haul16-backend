@@ -1,4 +1,4 @@
-"""LLM provider adapter. OpenAI now; an Anthropic provider drops in behind the same `complete_json` call.
+"""LLM provider adapter. Google Gemini now; another provider drops in behind the same `complete_json` call.
 
 Rules enforced here, not left to callers:
 - the model only ever receives extracted text, never tools, never a request to act;
@@ -28,27 +28,28 @@ class LLM:
         s = get_settings()
         self.client, self.store = client, store
         self.provider, self.model = s.llm_provider, s.llm_model
-        if self.provider == "openai":
-            self.key = s.openai_api_key
-        elif self.provider == "anthropic":
-            self.key = s.anthropic_api_key
+        if self.provider == "gemini":
+            self.key = s.gemini_api_key
         else:
             raise NotConfigured(f"unknown LLM_PROVIDER '{self.provider}'")
         if not self.key:
             raise NotConfigured(f"no API key set for LLM provider '{self.provider}'")
 
     async def _chat(self, system: str, user: str) -> tuple[str, dict]:
-        if self.provider == "openai":
-            res = await request(
-                self.client, "POST", "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {self.key}"}, timeout=90,
-                json={"model": self.model, "temperature": 0, "response_format": {"type": "json_object"},
-                      "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]})
-            if res.status_code >= 400:
-                raise UpstreamError(f"openai {res.status_code}: {res.text[:300]}")
-            body = res.json()
-            return body["choices"][0]["message"]["content"], body.get("usage") or {}
-        raise NotConfigured("the Anthropic provider is not implemented yet")  # add here when we ship on Anthropic
+        """One Gemini generateContent call. Returns (reply text, usage as prompt_tokens/completion_tokens)."""
+        res = await request(
+            self.client, "POST", f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent",
+            headers={"x-goog-api-key": self.key}, timeout=90,
+            json={"systemInstruction": {"parts": [{"text": system}]},
+                  "contents": [{"role": "user", "parts": [{"text": user}]}],
+                  "generationConfig": {"temperature": 0, "responseMimeType": "application/json"}})
+        if res.status_code >= 400:
+            raise UpstreamError(f"gemini {res.status_code}: {res.text[:300]}")
+        body = res.json()
+        parts = ((body.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+        text = "".join(p.get("text", "") for p in parts)  # empty when the reply was blocked: fails validation and gets the one retry
+        meta = body.get("usageMetadata") or {}
+        return text, {"prompt_tokens": meta.get("promptTokenCount"), "completion_tokens": meta.get("candidatesTokenCount")}
 
     def _log(self, brand_id, purpose, digest, usage, ok, error=None):
         if not self.store:

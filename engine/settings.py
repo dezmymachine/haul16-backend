@@ -41,10 +41,9 @@ class Settings(BaseSettings):
     test_database_url: str | None = None
 
     # LLM (provider adapter in engine/llm.py)
-    llm_provider: str = "openai"
-    llm_model: str = "gpt-4o-mini"
-    openai_api_key: str | None = None
-    anthropic_api_key: str | None = None
+    llm_provider: str = "gemini"
+    llm_model: str = "gemini-2.5-flash"
+    gemini_api_key: str | None = None
 
     # Collectors. Every one is optional: a missing key skips that collector and records why.
     firecrawl_api_key: str | None = None
@@ -52,10 +51,19 @@ class Settings(BaseSettings):
     apify_linkedin_actor: str | None = None   # Apify actor id for LinkedIn company pages, e.g. "owner~actor-name"
     apify_linkedin_input: str = '{"startUrls":[{"url":"{url}"}]}'  # JSON actor input; {url} is replaced
     apify_social_actor: str | None = None     # Apify actor id for generic public social profile lookups
-    search_provider: str = "brave"
-    search_api_key: str | None = None
+    search_provider: str = "firecrawl"        # firecrawl (uses FIRECRAWL_API_KEY) | brave (uses SEARCH_API_KEY)
+    search_api_key: str | None = None         # Brave only
     urlscan_api_key: str | None = None
     meta_ad_library_token: str | None = None
+    # Remote browser for evidence capture (optional: without keys the capture uses a local Chromium)
+    browserbase_api_key: str | None = None
+    browserbase_project_id: str | None = None
+    browserbase_proxy: bool = True            # route captures through a Browserbase-managed proxy
+    browserbase_country: str = "GH"           # proxy exit country (ISO alpha-2), best effort
+
+    @property
+    def search_ready(self) -> bool:
+        return bool(self.firecrawl_api_key if self.search_provider == "firecrawl" else self.search_api_key if self.search_provider == "brave" else False)
 
     @property
     def is_prod(self) -> bool:

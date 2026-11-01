@@ -45,7 +45,7 @@ hand-written `brand.yaml`. Design and rationale: the plan in the repo history an
 | Brand API (create, profile, verify, review facts, letter upload, activate) | **Done.** `engine/brand/routes.py` |
 | Detection reads the dossier | **Done.** `engine/brand/loader.py`; the active brand is chosen with `POST /api/brands/{id}/activate` |
 | Brand-scoped reads | **Done.** `?brand_id=` or `X-Brand-Id` header on stats, threats, cases, notices, report, brand |
-| LLM adapter | **Done for OpenAI** (`engine/llm.py`); Anthropic is a stub that raises `NotConfigured`, add it in `_chat` |
+| LLM adapter | **Done for Google Gemini** (`engine/llm.py`); to add another provider, branch in `__init__` and `_chat` |
 | Docker / Railway | `Dockerfile`, `railway.json`, `.dockerignore` added. See "Deploying" |
 | CT follower as its own process with a saved cursor | **Not done.** CT polling still runs inside the API process (`HAUL16_CT`) |
 | urlscan, Meta Ad Library, Telegram/WhatsApp assessment, agent loop, alerts, auth, real senders | **Not started** (Milestones 2 to 5 in the plan) |
@@ -71,11 +71,12 @@ Neon: set `DATABASE_URL` to the Neon connection string (it needs `?sslmode=requi
 | `dns` | A, NS, MX, SPF, email provider | nothing |
 | `rdap` | registrar, creation date, hosting network, abuse contacts | nothing |
 | `website` | home page plus about/contact/team/terms/legal pages: text, socials, phones, emails, app links, wallets, JSON-LD organisation, founders | nothing (Firecrawl, if keyed, supplies the page text and `map`) |
+| `subdomains` | hostnames under your confirmed domains that have had a certificate issued (crt.name, public certificate logs): your published estate, to spot forgotten or hijacked ones | nothing |
 | `assets` | logo and favicon files: sha256, perceptual hash (`imagehash`), favicon mmh3. Only the company's own logo (header/nav or named after the brand), never partner logos | nothing |
-| `linkedin` | company page facts (followers, employees, tagline, site) and key people | `APIFY_TOKEN`, `APIFY_LINKEDIN_ACTOR`, `APIFY_LINKEDIN_INPUT` |
-| `socials` | public Telegram channel previews (no login, no joining); other platforms via an Apify actor | nothing for Telegram; `APIFY_SOCIAL_ACTOR` for the rest |
-| `news` | press mentions and "scam/fake/phishing" warnings that name the brand | `SEARCH_API_KEY` (Brave) |
-| `dossier` | LLM extraction of legal names, registration numbers, licences, addresses, leadership, official contacts, payment instructions, a summary | `OPENAI_API_KEY` |
+| `linkedin` | company page facts (followers, employees, tagline, site) and key people | `FIRECRAWL_API_KEY`. LinkedIn company details come from Firecrawl's third-party enrichment, which an admin of the Firecrawl account switches on (and accepts the terms) at firecrawl.dev/app/alexandria?enrichment=true; it costs about 5-30 credits a company. Until then the step falls back to what search shows (official page, name, about text). With no LinkedIn link entered, search only suggests a page for a person to confirm. An Apify actor (`APIFY_TOKEN`, `APIFY_LINKEDIN_ACTOR`, `APIFY_LINKEDIN_INPUT`) still works and takes priority when set |
+| `socials` | public Telegram channel previews (no login, no joining); other platforms via an Apify actor | nothing for Telegram; `APIFY_SOCIAL_ACTOR` is optional and can stay empty (those platforms are then skipped) |
+| `news` | press mentions and "scam/fake/phishing" warnings that name the brand | `FIRECRAWL_API_KEY` (Firecrawl search; or `SEARCH_PROVIDER=brave` + `SEARCH_API_KEY`) |
+| `dossier` | LLM extraction of legal names, registration numbers, licences, addresses, leadership, official contacts, payment instructions, a summary | `GEMINI_API_KEY` |
 
 Every fact is a row in `brand_facts` (`kind`, `value`, `source_url`, `collector`, `confidence`, `verification`, `review_status`). Verification is
 computed in `BrandRepo.upsert_fact`: `verified` (the brand's own site and an independent source agree, or a person entered it), `corroborated`
@@ -115,9 +116,9 @@ Everything found goes through the same matcher, capture and scoring as certifica
 | `ct_history` | certificates issued in the last year whose names contain your names (crt.sh) | none |
 | `telegram_handles` | Telegram accounts and channels with look-alike handles that name the brand (public `t.me` pages, never joined) | none |
 | `urlscan` | recent public urlscan.io scans of domains containing your names (anonymous wildcard search is refused by urlscan, so it needs a key) | `URLSCAN_API_KEY` |
-| `web_search` | fake login and giveaway pages found by Brave search | `SEARCH_API_KEY` |
-| `news_mentions` | press naming the brand with scam wording (kept as `signals`) and the domains it cites | `SEARCH_API_KEY` |
-| `meta_ads` | Meta Ad Library ads using your name from other pages (Ghana, active) | `META_AD_LIBRARY_TOKEN` |
+| `web_search` | fake login and giveaway pages found by web search | `FIRECRAWL_API_KEY` (or Brave, see above) |
+| `news_mentions` | press naming the brand with scam wording (kept as `signals`) and the domains it cites | `FIRECRAWL_API_KEY` (or Brave) |
+| `meta_ads` | Meta Ad Library ads using your name from other pages (Ghana, active) | `META_AD_LIBRARY_TOKEN` (optional: empty = source skipped) |
 
 `GET /api/sources` lists them with `configured` and `enabled`; `PUT /api/sources/{id}` `{enabled}` switches one off (stored in `source_toggles`). The keyed sources are tested against mocked vendor responses only, not the live APIs.
 
@@ -138,7 +139,7 @@ Alerts are raised for medium and high findings, scans that found something, and 
 **Takedown detection** (`engine/liveness.py`). Every 30 minutes (and on `POST /api/cases/{id}/liveness`) the sites of filed notices are re-checked: domain no longer resolves, HTTP 404/410/451, a suspension notice, or a Telegram/WhatsApp page that no longer shows the account.
 A site that is gone gets an automatic `removed` clock event (`simulated = 0`, note "Detected automatically: ...") **only for really filed notices**; a dry-run notice sent nothing, so its site going down is not our takedown. Anything unclear is `unknown`, never `gone`. `GET /api/cases/{id}/liveness` returns the latest status per site.
 
-New environment variables: `PUBLIC_URL`, `PATROL_HOURS`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_SSL`, `EMAIL_FROM`, `EMAIL_REPLY_TO`, `ALERT_EMAIL_TO`, `ALERT_WEBHOOK_URL`, `ALERT_MIN_SEVERITY` (see `.env.example`). Not built: reading replies from registrars, multi-user login with roles, Anthropic provider.
+New environment variables: `PUBLIC_URL`, `PATROL_HOURS`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_SSL`, `EMAIL_FROM`, `EMAIL_REPLY_TO`, `ALERT_EMAIL_TO`, `ALERT_WEBHOOK_URL`, `ALERT_MIN_SEVERITY` (see `.env.example`). Not built: reading replies from registrars, multi-user login with roles.
 
 ### Brand API
 | Method | Path | |
@@ -517,7 +518,7 @@ event (store `simulated = 0`) and a small UI change; the state machine otherwise
   Have counsel confirm the proxy use.
 - **Concurrency and cost:** `Watch(workers=2)` today. A common brand name will queue; size workers, set per-host rate limits and a
   global cap on captures per hour. The `UNIQUE (brand_id, hostname)` constraint already de-dupes.
-- **Browsers:** `uv run playwright install --with-deps chromium` in the server image. Pin the Playwright version.
+- **Browsers:** evidence capture uses a remote Browserbase browser when `BROWSERBASE_API_KEY` is set (`BROWSERBASE_PROJECT_ID` is optional; exit proxy country `BROWSERBASE_COUNTRY`, default `GH`; the session id is stored on the capture and in the evidence pack, replay at `browserbase.com/sessions/<id>`). Without them, or if Browserbase fails, it falls back to a local Chromium: `uv run playwright install --with-deps chromium` in the server image. Pin the Playwright version.
 - **Retries:** unreachable hosts retry at 120s, 600s, 1800s (`RETRY_AFTER_S`). Tune from real data and add a later re-check for sites that go live days after the certificate.
 - **Prompt-injection safety:** page text is data. If you add any LLM step, give it no tools, a strict output schema and human review.
 

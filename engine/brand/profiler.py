@@ -12,10 +12,10 @@ import httpx
 
 from engine.brand import dossier, logos, site
 from engine.brand.repo import BrandRepo, derive_seed_terms, domain_of, now
-from engine.clients import dnsx, telegram
+from engine.clients import crtname, dnsx, telegram
 from engine.clients.apify import Apify
 from engine.clients.base import NotConfigured, UpstreamError, new_client, sha256_text
-from engine.clients.firecrawl import Firecrawl
+from engine.clients.firecrawl import Firecrawl, linkedin_slug
 from engine.clients.search import Search
 from engine.llm import LLM
 from engine.rdap import enrich as rdap_enrich
@@ -23,7 +23,7 @@ from engine.settings import get_settings
 from engine.store import Store
 
 SCAM_WORDS = re.compile(r"\b(scam|fake|phishing|impersonat\w*|fraud\w*|warning|beware|clone|spoof\w*|counterfeit)\b", re.I)
-COLLECTORS = ["inputs", "dns", "rdap", "website", "assets", "linkedin", "socials", "news", "dossier"]
+COLLECTORS = ["inputs", "dns", "rdap", "subdomains", "website", "assets", "linkedin", "socials", "news", "dossier"]
 
 
 @dataclass
@@ -92,6 +92,27 @@ async def c_rdap(ctx: Ctx) -> dict:
              data={"registrar": reg.get("registrar"), "registrar_abuse_email": reg.get("registrar_abuse_email"), "created": reg.get("created"),
                    "hosting_network": host.get("network"), "hosting_country": host.get("country"), "host_abuse_email": host.get("host_abuse_email"), "ips": info.get("ips")})
     return {"records": 1}
+
+
+async def c_subdomains(ctx: Ctx) -> dict:
+    """Every hostname under the brand's confirmed domains that has had a certificate issued (crt.name). The brand's own estate."""
+    apexes = [d for d in dict.fromkeys([ctx.domain, *(f["value"] for f in ctx.repo.facts(ctx.brand["id"], "domain") if f["review_status"] == "confirmed")])
+              if d and "." in d and not d.replace(".", "").isdigit() and not d.endswith((".local", ".localhost", ".test"))]
+    if not apexes:
+        raise NotConfigured("no public domain to look up")
+    total, errors = 0, []
+    for apex in apexes:
+        try:
+            hosts = await crtname.subdomains(ctx.http, apex)
+        except Exception as e:  # noqa: BLE001  one domain failing must not hide the others
+            errors.append(f"{apex}: {e}")
+            continue
+        total += len(hosts)
+        ctx.fact("subdomains", apex, collector="crtname", origin="third_party", source_url=f"{crtname.API}?apex={apex}", confidence=0.8,
+                 label=f"{len(hosts)} hostnames under {apex} in certificate logs", data={"count": len(hosts), "hosts": hosts[:300], "truncated": len(hosts) > 300})
+    if errors and not total:
+        raise UpstreamError("; ".join(errors)[:300])
+    return {"domains": len(apexes), "subdomains": total, **({"errors": errors} if errors else {})}
 
 
 def _record_page(ctx: Ctx, page: site.Page | dict, collector: str) -> None:
@@ -176,33 +197,71 @@ async def c_assets(ctx: Ctx) -> dict:
     return {"assets": n}
 
 
-async def c_linkedin(ctx: Ctx) -> dict:
-    url = ctx.brand.get("linkedin_url") or next((s["url"] for s in ctx.social_urls if s["platform"] == "linkedin"), None)
-    if not url:
-        raise NotConfigured("no LinkedIn page known")
-    apify = Apify(ctx.http)
-    s = get_settings()
-    actor_input = json.loads(s.apify_linkedin_input.replace("{url}", url))
-    items = await apify.run(s.apify_linkedin_actor, actor_input)
-    if not items:
-        return {"profiles": 0}
-    it = items[0]
+def _record_linkedin(ctx: Ctx, url: str, it: dict, collector: str, confidence: float) -> dict:
+    """Write the linkedin_profile fact (and the people, if the source has any). `it` uses the keys any of our sources return."""
     pick = lambda *keys: next((it[k] for k in keys if it.get(k) not in (None, "", [])), None)  # noqa: E731
     data = {"name": pick("name", "companyName", "title"), "followers": pick("followers", "followerCount", "followersCount"),
-            "employees": pick("employeeCount", "staffCount", "employees_count"), "tagline": pick("tagline", "headline"),
+            "employees": pick("employee_count", "employeeCount", "staffCount", "employees_count"), "tagline": pick("tagline", "headline"),
             "industry": pick("industry", "industries"), "website": pick("website", "websiteUrl"), "description": pick("description", "about"),
             "headquarters": pick("headquarter", "headquarters", "location")}
-    ctx.fact("linkedin_profile", url, collector="apify:linkedin", origin="third_party", source_url=url, confidence=0.8, label=str(data["name"] or "LinkedIn page"), data=data)
+    ctx.fact("linkedin_profile", url, collector=collector, origin="third_party", source_url=url, confidence=confidence, label=str(data["name"] or "LinkedIn page"), data=data)
     if data.get("website") and ctx.domain and domain_of(str(data["website"])) == ctx.domain:
-        ctx.fact("social", url, collector="apify:linkedin", origin="third_party", source_url=url, confidence=0.9, label="linkedin company page",
+        ctx.fact("social", url, collector=collector, origin="third_party", source_url=url, confidence=0.9, label="linkedin company page",
                  data={"platform": "linkedin", "handle": url.rstrip("/").split("/")[-1]})  # the page points back at the official site
+    people = it.get("employees") or it.get("leaders") or it.get("keyPeople") or []
     n_people = 0
-    for emp in (it.get("employees") or it.get("leaders") or it.get("keyPeople") or [])[:15]:
+    for emp in (people[:15] if isinstance(people, list) else []):
         if isinstance(emp, dict) and emp.get("name"):
-            ctx.repo.add_person(ctx.brand["id"], emp["name"], emp.get("title") or emp.get("position"), collector="apify:linkedin", source_url=url,
+            ctx.repo.add_person(ctx.brand["id"], emp["name"], emp.get("title") or emp.get("position"), collector=collector, source_url=url,
                                 profile_url=emp.get("url") or emp.get("profileUrl"), photo_url=emp.get("photo") or emp.get("image"))
             n_people += 1
     return {"profiles": 1, "people": n_people}
+
+
+async def _linkedin_candidate(ctx: Ctx, search: Search) -> dict:
+    """No LinkedIn link is known: look for the page by name. It is only a suggestion (a `social` fact a person must confirm),
+    and no enrichment credits are spent on it, because look-alike company pages exist."""
+    name = ctx.brand["display_name"]
+    for r in await search.web(f'site:linkedin.com/company "{name}"', 6):
+        slug = linkedin_slug(r.get("url"))
+        if slug and name.lower() in (r.get("title") or "").lower():
+            url = f"https://www.linkedin.com/company/{slug}"
+            ctx.fact("social", url, collector="firecrawl:search", origin="third_party", source_url=url, confidence=0.5,
+                     label="Possible LinkedIn page found by search: confirm it is yours", data={"platform": "linkedin", "handle": slug})
+            return {"profiles": 0, "candidates": 1, "via": "search"}
+    return {"profiles": 0, "candidates": 0, "via": "search"}
+
+
+async def c_linkedin(ctx: Ctx) -> dict:
+    s = get_settings()
+    url = ctx.brand.get("linkedin_url") or next((x["url"] for x in ctx.social_urls if x["platform"] == "linkedin"), None)
+    if s.apify_token and s.apify_linkedin_actor:                       # an Apify actor, when one is configured
+        if not url:
+            raise NotConfigured("no LinkedIn page known")
+        items = await Apify(ctx.http).run(s.apify_linkedin_actor, json.loads(s.apify_linkedin_input.replace("{url}", url)))
+        return _record_linkedin(ctx, url, items[0], "apify:linkedin", 0.8) if items else {"profiles": 0}
+    if not s.firecrawl_api_key:
+        raise NotConfigured("no LinkedIn source configured: set FIRECRAWL_API_KEY (or APIFY_TOKEN and APIFY_LINKEDIN_ACTOR)")
+    search = Search(ctx.http)
+    if not url:
+        return await _linkedin_candidate(ctx, search)
+    slug = linkedin_slug(url)
+    if not slug:
+        raise NotConfigured("the LinkedIn link is not a company page")
+    canonical, note = f"https://www.linkedin.com/company/{slug}", None
+    try:
+        rec = await Firecrawl(ctx.http).linkedin_company(canonical)
+        fields = rec["fields"] or ({"description": rec["markdown"][:1500]} if rec["markdown"] else {})
+        if fields:
+            return {**_record_linkedin(ctx, canonical, fields, "firecrawl:linkedin", 0.8), "via": "enrichment"}
+        note = "enrichment returned no record for this page"
+    except (NotConfigured, UpstreamError) as e:                        # enrichment is off or failing: fall back to what search shows
+        note = str(e)[:300]
+    hit = next((r for r in await search.web(f"site:linkedin.com/company/{slug}", 5) if linkedin_slug(r.get("url")) == slug), None)
+    if not hit:
+        return {"profiles": 0, "via": "search", "note": note}
+    title = re.sub(r"\s*[|\-\u2013]\s*LinkedIn\s*$", "", hit.get("title") or "").strip()
+    return {**_record_linkedin(ctx, canonical, {"name": title or None, "description": hit.get("snippet")}, "firecrawl:search", 0.6), "via": "search", "note": note}
 
 
 async def c_socials(ctx: Ctx) -> dict:
@@ -226,7 +285,7 @@ async def c_socials(ctx: Ctx) -> dict:
                              label=str(it.get("name") or it.get("fullName") or url), data={k: it.get(k) for k in ("followers", "followersCount", "verified", "biography", "description", "created") if it.get(k) is not None})
                     n += 1
     elif n == 0:
-        raise NotConfigured("no public Telegram handle found and no APIFY_SOCIAL_ACTOR configured")
+        raise NotConfigured("no public Telegram handle found for this brand")
     return {"profiles": n}
 
 
@@ -272,7 +331,7 @@ async def c_dossier(ctx: Ctx) -> dict:
     return {"items": n}
 
 
-FUNCS = {"inputs": c_inputs, "dns": c_dns, "rdap": c_rdap, "website": c_website, "assets": c_assets, "linkedin": c_linkedin,
+FUNCS = {"inputs": c_inputs, "dns": c_dns, "rdap": c_rdap, "subdomains": c_subdomains, "website": c_website, "assets": c_assets, "linkedin": c_linkedin,
          "socials": c_socials, "news": c_news, "dossier": c_dossier}
 
 

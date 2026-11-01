@@ -7,8 +7,8 @@ Everything a source finds goes through the same matcher, capture and scoring pip
   ct_history        certificates issued in the last year whose names contain the brand's terms (crt.sh)     no key
   telegram_handles  Telegram accounts and channels with look-alike handles that name the brand             no key
   urlscan           recent urlscan.io scans of domains containing the brand's terms                          URLSCAN_API_KEY
-  web_search        look-alike sites and "official" pages found by web search                                SEARCH_API_KEY (Brave)
-  news_mentions     press that names the brand with scam/fake/impersonation wording, and domains it cites    SEARCH_API_KEY (Brave)
+  web_search        look-alike sites and "official" pages found by web search                                FIRECRAWL_API_KEY (or SEARCH_API_KEY for Brave)
+  news_mentions     press that names the brand with scam/fake/impersonation wording, and domains it cites    FIRECRAWL_API_KEY (or SEARCH_API_KEY for Brave)
   meta_ads          Meta Ad Library ads that use the brand's name from pages that are not the brand's        META_AD_LIBRARY_TOKEN
 """
 import asyncio
@@ -203,9 +203,9 @@ SOURCES = {
 def source_catalog(store) -> list[dict]:
     """For the settings page: every source, whether its key is set, and whether an admin switched it off."""
     s = get_settings()
-    keys = {"URLSCAN_API_KEY": bool(s.urlscan_api_key), "SEARCH_API_KEY": bool(s.search_api_key), "META_AD_LIBRARY_TOKEN": bool(s.meta_ad_library_token)}
+    keys = {"URLSCAN_API_KEY": bool(s.urlscan_api_key), "SEARCH_API_KEY": s.search_ready, "META_AD_LIBRARY_TOKEN": bool(s.meta_ad_library_token)}
     off = {r["collector"] for r in store.db.execute("SELECT collector FROM source_toggles WHERE enabled=FALSE")}
-    return [{"id": k, "label": v[0], "description": v[1], "needs_key": v[2], "configured": (keys[v[2]] if v[2] else True), "enabled": k not in off}
+    return [{"id": k, "label": v[0], "description": v[1], "needs_key": ("FIRECRAWL_API_KEY" if v[2] == "SEARCH_API_KEY" and s.search_provider == "firecrawl" else v[2]), "configured": (keys[v[2]] if v[2] else True), "enabled": k not in off}
             for k, v in SOURCES.items()]
 
 

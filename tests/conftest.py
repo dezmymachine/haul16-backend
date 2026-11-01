@@ -11,7 +11,9 @@ os.environ["EMBEDDED_WORKER"] = "false"
 os.environ["SEED_DEMO_BRAND"] = "true"          # API tests use the fictional demo brand; one test turns it off
 # Whatever is in a developer's .env (sign-in, keys, SMTP, webhooks) must never change test behaviour.
 os.environ["HAUL16_ENV"] = "dev"
-for _k in ("OPENAI_API_KEY", "FIRECRAWL_API_KEY", "APIFY_TOKEN", "SEARCH_API_KEY", "URLSCAN_API_KEY", "META_AD_LIBRARY_TOKEN",
+os.environ["SEARCH_PROVIDER"] = "brave"      # existing vendor mocks speak Brave; the Firecrawl search test sets its own
+os.environ["LLM_PROVIDER"], os.environ["LLM_MODEL"] = "gemini", "gemini-2.5-flash"
+for _k in ("GEMINI_API_KEY", "FIRECRAWL_API_KEY", "APIFY_TOKEN", "SEARCH_API_KEY", "URLSCAN_API_KEY", "META_AD_LIBRARY_TOKEN", "BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID",
            "AUTH_OWNER_PASSWORD", "SESSION_SECRET", "SMTP_HOST", "ALERT_WEBHOOK_URL", "ALERT_EMAIL_TO"):
     os.environ[_k] = ""          # tests never call real vendors; collectors without a key skip
 

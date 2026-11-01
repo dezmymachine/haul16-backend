@@ -25,7 +25,7 @@ def build_pack(notice: dict, threat: dict, brand: dict | None) -> bytes:
         z.writestr("evidence.json", json.dumps({
             "notice_id": notice["id"], "case_id": notice["case_id"], "status": notice["status"],
             "site": {"hostname": threat["hostname"], "url": cap.get("final_url") or cap.get("url") or threat.get("url"), "detected_at": threat["detected_at"], "source": threat["source"]},
-            "capture": {k: cap.get(k) for k in ("captured_at", "capture_tool", "title", "html_sha256", "screenshot_sha256", "favicon_mmh3", "identifiers", "status")},
+            "capture": {k: cap.get(k) for k in ("captured_at", "capture_tool", "browser_session", "title", "html_sha256", "screenshot_sha256", "favicon_mmh3", "identifiers", "status")},
             "verdict": {k: verdict.get(k) for k in ("confidence", "score", "reason_codes", "evidence", "rules_version")},
             "enrichment": enr,
             "authorisation_letter_sha256": (brand or {}).get("authorisation_letter_sha256"),

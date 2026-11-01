@@ -23,6 +23,8 @@ from urllib.parse import urljoin, urlparse
 import mmh3
 from playwright.async_api import async_playwright
 
+from engine.clients import browserbase
+from engine.clients.base import new_client
 from engine.extract import extract
 
 CAPTURE_TOOL = "haul16-capture/0.1 (playwright-chromium)"
@@ -39,6 +41,7 @@ class Capture:
     status: int | None = None
     captured_at: str = ""
     capture_tool: str = CAPTURE_TOOL
+    browser_session: str | None = None           # Browserbase session id (replay at browserbase.com/sessions/<id>)
     title: str | None = None
     html_sha256: str | None = None
     screenshot_ref: str | None = None
@@ -70,6 +73,30 @@ def _is_private(host: str) -> bool:
     return False
 
 
+LOCAL_ARGS = ["--disable-extensions", "--disable-sync", "--no-first-run"]
+
+
+async def _open_browser(pw, allow_local: bool, cap: Capture):
+    """Returns (browser, context). A remote Browserbase browser when keyed (hostile pages then run off our server and exit through a
+    Ghana proxy); a local Chromium otherwise, for --allow-local fixtures, missing keys, or a Browserbase failure."""
+    if not allow_local and browserbase.configured():
+        try:
+            async with new_client(timeout=30) as http:
+                session_id, connect_url = await browserbase.create_session(http)
+            browser = await pw.chromium.connect_over_cdp(connect_url)
+            cap.capture_tool, cap.browser_session = "haul16-capture/0.1 (browserbase)", session_id
+            return browser, browser.contexts[0]       # a Browserbase session has its own default context
+        except Exception as e:  # noqa: BLE001  evidence from the local browser beats no evidence
+            cap.errors.append(f"browserbase unavailable, used local browser: {type(e).__name__}: {str(e)[:200]}")
+    browser = await pw.chromium.launch(args=LOCAL_ARGS)
+    ctx = await browser.new_context(
+        accept_downloads=False, java_script_enabled=True, ignore_https_errors=True,
+        viewport={"width": 1280, "height": 900}, service_workers="block", permissions=[],
+        user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36",
+    )
+    return browser, ctx
+
+
 async def capture(url: str, allow_local: bool = False, out_dir: Path = EVIDENCE_DIR, wait_until: str = "load") -> Capture:
     """wait_until: "load" for ordinary sites. Telegram and WhatsApp pages are server-rendered but load slowly in a headless browser, so they use "domcontentloaded"."""
     cap = Capture(url=url, captured_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
@@ -92,12 +119,7 @@ async def capture(url: str, allow_local: bool = False, out_dir: Path = EVIDENCE_
         await route.continue_()
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(args=["--disable-extensions", "--disable-sync", "--no-first-run"])
-        ctx = await browser.new_context(
-            accept_downloads=False, java_script_enabled=True, ignore_https_errors=True,
-            viewport={"width": 1280, "height": 900}, service_workers="block", permissions=[],
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36",
-        )
+        browser, ctx = await _open_browser(pw, allow_local, cap)
         await ctx.route("**/*", guard)
         page = await ctx.new_page()
         page.on("dialog", lambda d: asyncio.ensure_future(d.dismiss()))

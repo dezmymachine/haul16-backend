@@ -16,7 +16,7 @@ from engine.store import Store
 
 SINGULAR = {"legal_name", "registration_no", "incorporated", "hq_address"}
 CONFIRM_KINDS = {"phone", "wallet", "bank_account", "social", "telegram", "whatsapp"}   # used for matching only once a person confirms
-TYPE_ORDER = ["domain", "legal_name", "trading_name", "registration_no", "licence", "hq_address", "phone", "email", "social",
+TYPE_ORDER = ["domain", "subdomains", "legal_name", "trading_name", "registration_no", "licence", "hq_address", "phone", "email", "social",
               "telegram", "whatsapp", "app", "wallet", "bank_account", "regulator", "news", "warning", "dns", "domain_registration", "summary"]
 
 
