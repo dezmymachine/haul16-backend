@@ -13,7 +13,13 @@ def handlers(store: Store) -> dict:
     async def brand_profile(job: dict) -> dict:
         def progress(state: dict) -> None:
             store.db.execute("UPDATE jobs SET result=? WHERE id=?", (__import__("json").dumps(state), job["id"]))
-        return await run_profile(store, job["brand_id"], progress)
+        try:
+            return await run_profile(store, job["brand_id"], progress)
+        except Exception:
+            # never leave a brand stuck in 'profiling' if the job itself fails
+            row = store.db.execute("SELECT active_version FROM brands WHERE id=?", (job["brand_id"],)).fetchone()
+            store.db.execute("UPDATE brands SET status=? WHERE id=?", ("ready" if row and row["active_version"] else "draft", job["brand_id"]))
+            raise
     return {"brand_profile": brand_profile}
 
 

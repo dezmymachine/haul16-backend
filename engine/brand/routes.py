@@ -85,6 +85,7 @@ def run_profile(brand_id: str):
     if cur and cur["status"] in ("queued", "running"):
         return cur
     jobs.enqueue(STATE.store, "brand_profile", brand_id, {}, max_attempts=2)
+    repo().update(brand_id, status="profiling")
     return _job(brand_id)
 
 

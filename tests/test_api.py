@@ -70,6 +70,7 @@ def test_brand_onboarding_verification_and_review(client, monkeypatch):
     assert v["record_name"] == "_haul16-verify.acme.test" and v["record_value"].startswith("haul16-verify=") and b["ownership_status"] == "unverified"
 
     j1 = client.post(f"/api/brands/{b['id']}/profile/run").json()
+    assert client.get(f"/api/brands/{b['id']}").json()["status"] == "profiling"           # visible to the UI straight away
     assert j1["status"] == "queued" and client.post(f"/api/brands/{b['id']}/profile/run").json()["id"] == j1["id"]   # no duplicate jobs
 
     async def no_dns(name):

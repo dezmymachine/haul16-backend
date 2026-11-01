@@ -91,8 +91,8 @@ async def stats_ticker() -> None:
 async def lifespan(app: FastAPI):
     S.store = Store()
     repo = BrandRepo(S.store)
-    if not repo.list_all():
-        import_yaml(S.store)                       # first run: seed the fictional demo brand from brand.yaml
+    if not repo.list_all() or not SETTINGS.is_prod:
+        import_yaml(S.store)                       # the fictional demo brand (idempotent); production seeds it only when no brand exists yet
     row = S.store.db.execute("SELECT id FROM brands WHERE is_active LIMIT 1").fetchone() or S.store.db.execute(
         "SELECT id FROM brands WHERE status='ready' ORDER BY created_at LIMIT 1").fetchone()
     brand, cfg = brand_from_db(repo, row["id"])
