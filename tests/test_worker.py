@@ -3,7 +3,6 @@ import asyncio
 from pathlib import Path
 
 from engine.matcher import Brand
-from engine.store import Store
 from engine.worker import Watch
 
 from tests.test_capture_score import server  # noqa: F401  (reuse the fixture web server)
@@ -11,8 +10,7 @@ from tests.test_capture_score import server  # noqa: F401  (reuse the fixture we
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_watch_links_campaign_and_skips_decoy(server, tmp_path):  # noqa: F811
-    store = Store(tmp_path / "t.db")
+def test_watch_links_campaign_and_skips_decoy(server, store):  # noqa: F811
     watch = Watch(Brand.load(ROOT / "brand.yaml"), store, allow_local=True, workers=1, enrich_hosts=False)
 
     async def go():
@@ -47,8 +45,8 @@ def test_watch_links_campaign_and_skips_decoy(server, tmp_path):  # noqa: F811
     assert "{" not in mtn["body"]                                 # every placeholder filled
 
 
-def test_unreachable_is_retried(tmp_path):
-    watch = Watch(Brand.load(ROOT / "brand.yaml"), Store(tmp_path / "t.db"), workers=1, enrich_hosts=False)
+def test_unreachable_is_retried(store):
+    watch = Watch(Brand.load(ROOT / "brand.yaml"), store, workers=1, enrich_hosts=False)
     watch.retry_after = (0.05,)
 
     async def go():

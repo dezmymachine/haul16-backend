@@ -24,13 +24,15 @@ from pydantic import BaseModel, Field
 
 from engine import ct_poll, notices
 from engine.pipeline import Pipeline
-from engine.store import DB_PATH, Store
+from engine.settings import get_settings
+from engine.store import Store
 from engine.worker import Watch, load_brand
 
 ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE = ROOT / "data" / "evidence"
-PORT = int(os.environ.get("HAUL16_PORT", "8000"))
-CT_ENABLED = os.environ.get("HAUL16_CT", "1") != "0"
+SETTINGS = get_settings()
+PORT = SETTINGS.haul16_port
+CT_ENABLED = SETTINGS.haul16_ct
 DEMO_HOSTS = {"clone": "nkwaex-support.com", "clone2": "nkwaex-airdrop.top", "decoy": "nkwafarms.com"}
 
 
@@ -83,10 +85,11 @@ async def stats_ticker() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     brand, cfg = load_brand(ROOT / "brand.yaml")
-    S.store = Store(DB_PATH)
+    S.store = Store()
     S.watch = Watch(brand, S.store, brand_cfg=cfg, workers=2)
     S.pipe = Pipeline(S.watch.matcher, ROOT / "data" / "hits.jsonl", on_hit=S.watch.on_hit)
     S.lag, S.started = {}, time.monotonic()
+    S.watch.recover()          # threats left 'queued' by a restart go back on the capture queue
     tasks = [asyncio.create_task(S.watch.capture_worker()) for _ in range(S.watch.workers)]
     tasks.append(asyncio.create_task(stats_ticker()))
     if CT_ENABLED:
@@ -97,7 +100,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="HAUL16", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+app.add_middleware(CORSMiddleware, allow_origins=SETTINGS.origins,
                    allow_methods=["*"], allow_headers=["*"])
 app.mount("/demo-sites", StaticFiles(directory=ROOT / "fixtures" / "sites", html=True), name="demo-sites")
 

@@ -1,87 +1,14 @@
-"""SQLite store: threats, cases, shared identifiers (campaign links) and an audit log.
+"""Postgres store: threats, cases, shared identifiers (campaign links) and an audit log.
 
 Every state change goes through here and is written to audit_log.
 """
 import json
-import sqlite3
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-DB_PATH = ROOT / "data" / "haul16.db"
+from engine.db import Database, migrate
+from engine.settings import get_settings
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS threats (
-  id TEXT PRIMARY KEY,
-  brand_id TEXT NOT NULL,
-  hostname TEXT NOT NULL,
-  url TEXT,
-  source TEXT NOT NULL,
-  source_ref TEXT,                 -- e.g. ct log + index
-  detected_at TEXT NOT NULL,
-  stage_a TEXT,                    -- JSON: matcher candidate
-  status TEXT NOT NULL,            -- queued | captured | scored | error
-  capture TEXT,                    -- JSON: capture record
-  verdict TEXT,                    -- JSON: score verdict
-  enrichment TEXT,                 -- JSON: RDAP registrar + hosting
-  confidence TEXT,
-  score INTEGER,
-  case_id TEXT,
-  updated_at TEXT NOT NULL,
-  UNIQUE (brand_id, hostname)
-);
-CREATE TABLE IF NOT EXISTS cases (
-  id TEXT PRIMARY KEY,
-  brand_id TEXT NOT NULL,
-  opened_at TEXT NOT NULL,
-  status TEXT NOT NULL,            -- open | closed
-  title TEXT
-);
-CREATE TABLE IF NOT EXISTS identifiers (
-  threat_id TEXT NOT NULL,
-  kind TEXT NOT NULL,              -- phone | wallet | telegram
-  value TEXT NOT NULL,
-  PRIMARY KEY (threat_id, kind, value)
-);
-CREATE INDEX IF NOT EXISTS identifiers_value ON identifiers (kind, value);
-CREATE TABLE IF NOT EXISTS notices (
-  id TEXT PRIMARY KEY,
-  case_id TEXT NOT NULL,
-  threat_id TEXT NOT NULL,
-  channel TEXT NOT NULL,
-  channel_name TEXT,
-  method TEXT,
-  recipient TEXT,
-  recipient_verified INTEGER,
-  subject TEXT,
-  body TEXT,
-  evidence_refs TEXT,              -- JSON
-  status TEXT NOT NULL,            -- drafted | approved | filed_dry_run | rejected
-  drafted_at TEXT NOT NULL,
-  approved_by TEXT,
-  approved_at TEXT,
-  filed_at TEXT,
-  UNIQUE (threat_id, channel)
-);
-CREATE TABLE IF NOT EXISTS clock_events (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  case_id TEXT NOT NULL,
-  notice_id TEXT,
-  channel TEXT,
-  event TEXT NOT NULL,             -- detected | filed | first_response | removed
-  ts TEXT NOT NULL,
-  simulated INTEGER NOT NULL,      -- 1 while HAUL16 runs dry
-  note TEXT
-);
-CREATE TABLE IF NOT EXISTS audit_log (
-  ts TEXT NOT NULL,
-  actor TEXT NOT NULL,
-  action TEXT NOT NULL,
-  ref TEXT,
-  detail TEXT
-);
-"""
 
 # Identifiers strong enough to link two threats into one campaign. A shared
 # registrar, host or copied favicon is NOT enough: it would smear innocents.
@@ -97,12 +24,11 @@ def new_id(prefix: str) -> str:
 
 
 class Store:
-    def __init__(self, path: Path = DB_PATH):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path, check_same_thread=False)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.executescript(SCHEMA)
+    def __init__(self, url: str | None = None, migrate_schema: bool = True):
+        url = url or get_settings().database_url
+        if migrate_schema:
+            migrate(url)
+        self.db = Database(url)
 
     def audit(self, actor: str, action: str, ref: str | None = None, detail: object = None) -> None:
         self.db.execute("INSERT INTO audit_log VALUES (?,?,?,?,?)",
@@ -114,8 +40,8 @@ class Store:
         """Insert a new threat. Returns its id, or None if we already track this hostname."""
         tid = new_id("thr")
         cur = self.db.execute(
-            "INSERT OR IGNORE INTO threats (id, brand_id, hostname, url, source, source_ref, detected_at,"
-            " stage_a, status, updated_at) VALUES (?,?,?,?,?,?,?,?, 'queued', ?)",
+            "INSERT INTO threats (id, brand_id, hostname, url, source, source_ref, detected_at,"
+            " stage_a, status, updated_at) VALUES (?,?,?,?,?,?,?,?, 'queued', ?) ON CONFLICT DO NOTHING",
             (tid, brand_id, hostname, url, source, source_ref, now(), json.dumps(stage_a), now()))
         self.db.commit()
         if cur.rowcount == 0:
@@ -136,7 +62,7 @@ class Store:
         rows = [(tid, "phone", p) for p in foreign.get("phones", [])]
         rows += [(tid, "wallet", w) for w in foreign.get("wallets", [])]
         rows += [(tid, "telegram", t.lower()) for t in telegram]
-        self.db.executemany("INSERT OR IGNORE INTO identifiers VALUES (?,?,?)", rows)
+        self.db.executemany("INSERT INTO identifiers VALUES (?,?,?) ON CONFLICT DO NOTHING", rows)
         self.db.commit()
 
     def assign_case(self, tid: str, brand_id: str, title: str) -> tuple[str, list[dict]]:
@@ -211,7 +137,7 @@ class Store:
         threats = [self._row(r) for r in self.db.execute(
             "SELECT * FROM threats WHERE case_id=? ORDER BY detected_at", (case_id,))]
         ids = [self._row(r) for r in self.db.execute(
-            """SELECT i.kind, i.value, GROUP_CONCAT(t.hostname, ' | ') AS hosts, COUNT(*) AS n
+            """SELECT i.kind, i.value, string_agg(t.hostname, ' | ') AS hosts, COUNT(*) AS n
                FROM identifiers i JOIN threats t ON t.id = i.threat_id
                WHERE t.case_id=? GROUP BY i.kind, i.value ORDER BY n DESC""", (case_id,))]
         return {**dict(c), "threats": threats, "identifiers": ids,
@@ -228,9 +154,9 @@ class Store:
         for d in drafts:
             nid = new_id("ntc")
             cur = self.db.execute(
-                """INSERT OR IGNORE INTO notices (id, case_id, threat_id, channel, channel_name, method, recipient,
+                """INSERT INTO notices (id, case_id, threat_id, channel, channel_name, method, recipient,
                    recipient_verified, subject, body, evidence_refs, status, drafted_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?, 'drafted', ?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?, 'drafted', ?) ON CONFLICT DO NOTHING""",
                 (nid, case_id, threat_id, d["channel"], d["channel_name"], d["method"], d["recipient"],
                  int(d["recipient_verified"]), d["subject"], d["body"], json.dumps(d["evidence_refs"]), now()))
             if cur.rowcount:
@@ -299,8 +225,8 @@ class Store:
 
     def counts(self, brand_id: str) -> dict:
         one = lambda q: self.db.execute(q, (brand_id,)).fetchone()[0]  # noqa: E731
-        by_conf = dict(self.db.execute(
-            "SELECT COALESCE(confidence,'pending'), COUNT(*) FROM threats WHERE brand_id=? GROUP BY 1", (brand_id,)))
+        by_conf = {r[0]: r[1] for r in self.db.execute(
+            "SELECT COALESCE(confidence,'pending'), COUNT(*) FROM threats WHERE brand_id=? GROUP BY 1", (brand_id,))}
         return {
             "threats": one("SELECT COUNT(*) FROM threats WHERE brand_id=?"),
             "by_confidence": by_conf,

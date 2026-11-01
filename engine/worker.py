@@ -21,7 +21,8 @@ from engine.matcher import Brand, Matcher
 from engine.pipeline import Pipeline
 from engine.rdap import enrich
 from engine.score import score
-from engine.store import DB_PATH, Store
+from engine.settings import get_settings
+from engine.store import Store
 
 ROOT = Path(__file__).resolve().parents[1]
 OPEN_CASE_AT = {"medium", "high"}          # low and unknown stay in the feed only
@@ -73,6 +74,14 @@ class Watch:
                           "reasons": cand.reasons if cand else [], "source": source})
             self.queue.put_nowait((tid, host, url, self.allow_local if allow_local is None else allow_local))
         return tid
+
+    def recover(self) -> int:
+        """Put threats left in 'queued' (a restart mid-pipeline) back on the capture queue. Makes the in-process queue durable."""
+        rows = self.store.db.execute("SELECT id, hostname, url FROM threats WHERE brand_id=? AND status='queued'",
+                                     (self.brand.brand_id,)).fetchall()
+        for r in rows:
+            self.queue.put_nowait((r["id"], r["hostname"], r["url"], self.allow_local))
+        return len(rows)
 
     # ---- processing --------------------------------------------------------
 
@@ -140,7 +149,7 @@ def load_brand(path: str | Path) -> tuple[Brand, dict]:
 
 async def main_async(args) -> None:
     brand, cfg = load_brand(args.brand)
-    watch = Watch(brand, Store(Path(args.db)), allow_local=args.allow_local, workers=args.workers, brand_cfg=cfg)
+    watch = Watch(brand, Store(args.db), allow_local=args.allow_local, workers=args.workers, brand_cfg=cfg)
     for url in args.inject or []:
         watch.inject(url, args.as_host)
     workers = [asyncio.create_task(watch.capture_worker()) for _ in range(watch.workers)]
@@ -159,7 +168,7 @@ async def main_async(args) -> None:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--brand", default=str(ROOT / "brand.yaml"))
-    ap.add_argument("--db", default=str(DB_PATH))
+    ap.add_argument("--db", default=get_settings().database_url, help="Postgres URL")
     ap.add_argument("--inject", action="append", help="URL to push through capture and scoring")
     ap.add_argument("--as-host", help="hostname to score the injected URL as (fixtures, replay)")
     ap.add_argument("--allow-local", action="store_true", help="permit localhost captures (fixtures only)")
