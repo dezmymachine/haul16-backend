@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from engine import alerts, auth, ct_poll, discovery, jobs, notices, patrol
+from engine import alerts, auth, ct_poll, discovery, jobs, liveness, notices, pack, patrol, senders
 from engine.brand import routes as brand_routes
 from engine.brand.import_yaml import import_yaml
 from engine.brand.loader import NO_BRAND, brand_from_db
@@ -141,7 +141,7 @@ def health():
         queued = S.store.db.execute("SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued','running')").fetchone()["n"]
     except Exception:  # noqa: BLE001
         db_ok, queued = False, None
-    return {"ok": db_ok, "dry_run": SETTINGS.haul16_dry_run, "ct_enabled": CT_ENABLED, "env": SETTINGS.haul16_env, "db": db_ok,
+    return {"ok": db_ok, "dry_run": get_settings().haul16_dry_run, "email_ready": senders.smtp_ready(), "ct_enabled": CT_ENABLED, "env": SETTINGS.haul16_env, "db": db_ok,
             "jobs_pending": queued, "embedded_worker": SETTINGS.embedded_worker,
             "collectors": {"llm": bool(SETTINGS.openai_api_key if SETTINGS.llm_provider == "openai" else SETTINGS.anthropic_api_key),
                            "firecrawl": bool(SETTINGS.firecrawl_api_key), "apify": bool(SETTINGS.apify_token and SETTINGS.apify_linkedin_actor),
@@ -258,7 +258,7 @@ def audit(limit: int = 100):
 
 @app.get("/api/notices")
 def list_notices(status: str | None = None, b: str = Depends(bid)):
-    if status and status not in ("drafted", "approved", "filed_dry_run", "rejected"):
+    if status and status not in ("drafted", "approved", "filed_dry_run", "filed", "rejected"):
         raise HTTPException(422, "Unknown notice status")
     return S.store.all_notices(b, status)
 
@@ -311,8 +311,16 @@ def reject(nid: str, body: Reject, request: Request):
     return S.store.notice(nid)
 
 
+class FileIn(BaseModel):
+    mode: str = Field(default="dry_run", pattern="^(dry_run|manual|email)$")
+    reference: str | None = Field(default=None, max_length=300)      # for "manual": where it was filed, or the reference you were given
+
+
 @app.post("/api/notices/{nid}/file")
-def file_notice(nid: str):
+async def file_notice(nid: str, request: Request, body: FileIn | None = None):
+    """Three ways to file an approved notice. dry_run: nothing leaves the server. manual: a person filed it on the recipient's own site and
+    records it here. email: HAUL16 sends it (only when HAUL16_DRY_RUN is off, SMTP is configured and the recipient address is verified)."""
+    body = body or FileIn()
     n = _notice(nid)
     if n["status"] != "approved":
         raise HTTPException(409, "A person must approve this notice before it is filed")
@@ -321,7 +329,27 @@ def file_notice(nid: str):
         raise HTTPException(409, "Prove you control the brand's domain before filing (Brand, then Verify and letter)")
     if not brand["authorisation_letter_sha256"]:
         raise HTTPException(409, "Upload the signed authorisation letter before filing (Brand, then Verify and letter)")
-    S.store.file_notice(nid, n["approved_by"])
+    case_brand = brand
+    detail: dict = {}
+    if body.mode == "email":
+        cfg = get_settings()
+        if cfg.haul16_dry_run:
+            raise HTTPException(409, "Sending is switched off (dry run). Set HAUL16_DRY_RUN=0 on the server to send for real, or file it by hand.")
+        if n["method"] != "email" or "@" not in (n["recipient"] or ""):
+            raise HTTPException(409, "This channel is a web form, not an email address. File it on the recipient's site and record it as filed by hand.")
+        if not n["recipient_verified"]:
+            raise HTTPException(409, "This recipient address is not verified yet. Confirm it on the organisation's official page first, or file by hand.")
+        if not senders.smtp_ready():
+            raise HTTPException(409, "Email is not set up on this server (SMTP_HOST).")
+        threat = S.store.threat(n["threat_id"])
+        attachments = [("evidence-pack.zip", pack.build_pack(n, threat, case_brand), "application/zip")]
+        if (lf := pack.letter_file(case_brand)):
+            attachments.insert(0, (f"authorisation-letter{lf.suffix}", lf.read_bytes(), "application/octet-stream"))
+        try:
+            detail["message_id"] = await senders.send_email(n["recipient"], n["subject"], n["body"], attachments)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"The email could not be sent: {e}") from e
+    S.store.file_notice(nid, n["approved_by"], body.mode, (body.reference or None), detail)
     S.watch.publish({"type": "filed", "notice_id": nid, "case_id": n["case_id"], "channel": n["channel"]})
     return S.store.notice(nid)
 
@@ -329,10 +357,34 @@ def file_notice(nid: str):
 @app.post("/api/notices/{nid}/clock")
 def clock(nid: str, body: ClockIn):
     n = _notice(nid)
-    if n["status"] != "filed_dry_run":
+    if n["status"] not in ("filed_dry_run", "filed"):
         raise HTTPException(409, "File the notice before logging a response")
-    S.store.clock_event(n["case_id"], nid, n["channel"], body.event, body.note, simulated=True)
+    S.store.clock_event(n["case_id"], nid, n["channel"], body.event, body.note, simulated=(n["status"] == "filed_dry_run"))
     return S.store.clock(n["case_id"])
+
+
+@app.get("/api/notices/{nid}/pack")
+def notice_pack(nid: str):
+    from fastapi.responses import Response
+    n = _notice(nid)
+    case = S.store.db.execute("SELECT brand_id FROM cases WHERE id=?", (n["case_id"],)).fetchone()
+    data = pack.build_pack(n, S.store.threat(n["threat_id"]), BrandRepo(S.store).get(case["brand_id"]))
+    return Response(data, media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="haul16-evidence-{nid}.zip"'})
+
+
+@app.get("/api/cases/{case_id}/liveness")
+def case_liveness(case_id: str):
+    if not S.store.case(case_id):
+        raise HTTPException(404, "No such case")
+    return liveness.latest(S.store, case_id)
+
+
+@app.post("/api/cases/{case_id}/liveness")
+async def case_liveness_run(case_id: str):
+    if not S.store.case(case_id):
+        raise HTTPException(404, "No such case")
+    await liveness.check_case(S.store, case_id)
+    return liveness.latest(S.store, case_id)
 
 
 # ---- intake -----------------------------------------------------------------
@@ -438,7 +490,7 @@ def report(month: str | None = None, b: str = Depends(bid)):
         "threats_detected": len(threats_), "threats_by_confidence": by_conf,
         "cases_opened": len(cases_),
         "notices": {s: sum(1 for c in cases_ for n in S.store.notices(c["id"]) if n["status"] == s)
-                    for s in ("drafted", "approved", "filed_dry_run", "rejected")},
+                    for s in ("drafted", "approved", "filed_dry_run", "filed", "rejected")},
         "channels": channels,
         "cases": [{"id": c["id"], "opened_at": c["opened_at"], "threats": c["threat_count"],
                    "filed": c["filed_count"], "removed": c["removed_count"], "status": c["status"]} for c in cases_],

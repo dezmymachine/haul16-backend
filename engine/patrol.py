@@ -47,10 +47,16 @@ def tick(store, watch) -> bool:
     return False
 
 
-async def patrol_loop(store, watch, every_s: float = 60) -> None:
+async def patrol_loop(store, watch, every_s: float = 60, liveness_every: int = 30) -> None:
+    """Each minute: queue a scan if one is due. Every `liveness_every` minutes: re-check sites that have filed notices, to detect takedowns."""
+    from engine import liveness
+    n = 0
     while True:
         await asyncio.sleep(every_s)
+        n += 1
         try:
             await asyncio.to_thread(tick, store, watch)
+            if n % liveness_every == 0 and watch.brand.brand_id != "__none__":
+                await liveness.check_brand(store, watch.brand.brand_id)
         except Exception as e:  # noqa: BLE001  a patrol hiccup must never take the API down
             print(f"patrol: {e!r}", flush=True)

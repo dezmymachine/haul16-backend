@@ -124,7 +124,7 @@ class Store:
             """SELECT c.*, COUNT(DISTINCT t.id) AS threat_count, MAX(t.score) AS max_score,
                       MIN(t.detected_at) AS first_detected,
                       (SELECT COUNT(*) FROM notices n WHERE n.case_id = c.id) AS notice_count,
-                      (SELECT COUNT(*) FROM notices n WHERE n.case_id = c.id AND n.status='filed_dry_run') AS filed_count,
+                      (SELECT COUNT(*) FROM notices n WHERE n.case_id = c.id AND n.status IN ('filed_dry_run','filed')) AS filed_count,
                       (SELECT COUNT(*) FROM clock_events e WHERE e.case_id = c.id AND e.event='removed') AS removed_count
                FROM cases c LEFT JOIN threats t ON t.case_id = c.id
                WHERE c.brand_id=? GROUP BY c.id ORDER BY c.opened_at DESC""", (brand_id,))
@@ -197,12 +197,15 @@ class Store:
         self.db.commit()
         self.audit(approver, "notice_rejected", nid, {"reason": reason})
 
-    def file_notice(self, nid: str, actor: str) -> None:
+    def file_notice(self, nid: str, actor: str, mode: str = "dry_run", note: str | None = None, detail: dict | None = None) -> None:
+        """mode: dry_run (nothing sent, simulated clock), manual (a person filed it on the recipient's own site), email (HAUL16 sent it)."""
         n = self.notice(nid)
         ts = now()
-        self.db.execute("UPDATE notices SET status='filed_dry_run', filed_at=? WHERE id=?", (ts, nid))
-        self.clock_event(n["case_id"], nid, n["channel"], "filed", "Dry run: nothing was sent.", ts=ts)
-        self.audit(actor, "notice_filed_dry_run", nid)
+        real = mode in ("manual", "email")
+        self.db.execute("UPDATE notices SET status=?, filed_at=? WHERE id=?", ("filed" if real else "filed_dry_run", ts, nid))
+        default = {"dry_run": "Dry run: nothing was sent.", "manual": "Filed by hand by a person.", "email": "Sent by email by HAUL16."}[mode]
+        self.clock_event(n["case_id"], nid, n["channel"], "filed", note or default, ts=ts, simulated=not real)
+        self.audit(actor, "notice_filed" if real else "notice_filed_dry_run", nid, {"mode": mode, **(detail or {})})
 
     def clock_event(self, case_id: str, notice_id: str | None, channel: str | None, event: str,
                     note: str | None = None, ts: str | None = None, simulated: bool = True) -> None:
@@ -235,5 +238,5 @@ class Store:
             "notices_awaiting_approval": one(
                 "SELECT COUNT(*) FROM notices n JOIN cases c ON c.id=n.case_id WHERE c.brand_id=? AND n.status='drafted'"),
             "notices_filed": one(
-                "SELECT COUNT(*) FROM notices n JOIN cases c ON c.id=n.case_id WHERE c.brand_id=? AND n.status='filed_dry_run'"),
+                "SELECT COUNT(*) FROM notices n JOIN cases c ON c.id=n.case_id WHERE c.brand_id=? AND n.status IN ('filed_dry_run','filed')"),
         }

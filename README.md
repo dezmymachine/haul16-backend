@@ -105,6 +105,41 @@ Safety built in:
 - **Setup state:** `GET /api/brands/{id}/setup` returns `{step, complete, steps, next_action, sweep, counts}` computed server-side, so the setup wizard and the Home page always agree on the one next thing to do.
   Order of `next_action`: profile building, details to confirm, start protection, notices to approve, notices to file (or prove ownership first), prove ownership, all clear.
 
+### Milestones 2 to 5: discovery, Telegram and WhatsApp, patrols and alerts, real filing
+**Discovery scan** (`engine/discovery.py`). One scan runs every enabled source. Each is isolated: a source that needs a key it lacks is `skipped` with the reason, one that fails is `error`, neither stops the rest.
+Everything found goes through the same matcher, capture and scoring as certificate-log hits (`Watch.inject`), so cases and draft notices work unchanged. Per-source status is on the scan job and returned by `GET /api/brands/{id}/sweep/status` (`sources`).
+
+| Source | Finds | Key |
+|---|---|---|
+| `dns_sweep` | typo, homoglyph, hyphen, lure-word and TLD variants of your domain that exist in DNS | none |
+| `ct_history` | certificates issued in the last year whose names contain your names (crt.sh) | none |
+| `telegram_handles` | Telegram accounts and channels with look-alike handles that name the brand (public `t.me` pages, never joined) | none |
+| `urlscan` | recent public urlscan.io scans of domains containing your names (anonymous wildcard search is refused by urlscan, so it needs a key) | `URLSCAN_API_KEY` |
+| `web_search` | fake login and giveaway pages found by Brave search | `SEARCH_API_KEY` |
+| `news_mentions` | press naming the brand with scam wording (kept as `signals`) and the domains it cites | `SEARCH_API_KEY` |
+| `meta_ads` | Meta Ad Library ads using your name from other pages (Ghana, active) | `META_AD_LIBRARY_TOKEN` |
+
+`GET /api/sources` lists them with `configured` and `enabled`; `PUT /api/sources/{id}` `{enabled}` switches one off (stored in `source_toggles`). The keyed sources are tested against mocked vendor responses only, not the live APIs.
+
+**Telegram and WhatsApp.** `t.me/<handle>` and `chat.whatsapp.com/<code>` are tracked as threats (the "hostname" is platform plus handle). Stage A (`Watch.social_candidate`) scores a handle that contains a brand name as `handle_lookalike`;
+the page capture (Telegram's `/s/` page shows a channel's public posts) supplies the rest: phones and wallets feed campaign linking exactly as for websites. `assess_social` adds the public Telegram preview and any WhatsApp invite-link previews
+to the threat's enrichment. An unused Telegram handle still serves a page, so existence is decided by the page-title block, not the `og:title`. New notice channels `telegram` (`abuse@telegram.org`) and `whatsapp` (web form) are `verified: false`: confirm the route before relying on them. Safe Browsing now applies to web URLs only.
+
+**Patrols and alerts.** `engine/patrol.py` scans an active brand again every `PATROL_HOURS` (default 6, per brand in Settings, 0 = off). `engine/alerts.py` stores an alert per (brand, kind, ref), so the same finding never alerts twice,
+and pushes alerts of at least `ALERT_MIN_SEVERITY` (default `medium`) to `ALERT_WEBHOOK_URL` (JSON with a Slack-compatible `text` field) and, with `SMTP_HOST` and `ALERT_EMAIL_TO`, to email. Delivery failures are recorded on the alert and never raise.
+Alerts are raised for medium and high findings, scans that found something, and confirmed takedowns. `GET /api/alerts`, `POST /api/alerts/read`, `POST /api/alerts/test` (sends a real test through every configured channel).
+
+**Real filing.** `POST /api/notices/{id}/file` takes `{mode, reference?}`:
+- `dry_run` (default): nothing leaves the server, simulated clock, status `filed_dry_run`.
+- `manual`: a person filed it on the recipient's own site and records it (status `filed`, real clock, optional reference).
+- `email`: HAUL16 sends it over SMTP with the authorisation letter and an evidence pack attached. Allowed only when `HAUL16_DRY_RUN=0`, `SMTP_HOST` is set, the channel is an email address, and the recipient is `verified`; any failure leaves the notice approved. Replies are not read yet.
+`GET /api/notices/{id}/pack` downloads the evidence pack zip (notice text, `evidence.json` with hashes and verdict, screenshot, page source, the letter). Ownership and letter gates apply to every mode.
+
+**Takedown detection** (`engine/liveness.py`). Every 30 minutes (and on `POST /api/cases/{id}/liveness`) the sites of filed notices are re-checked: domain no longer resolves, HTTP 404/410/451, a suspension notice, or a Telegram/WhatsApp page that no longer shows the account.
+A site that is gone gets an automatic `removed` clock event (`simulated = 0`, note "Detected automatically: ...") **only for really filed notices**; a dry-run notice sent nothing, so its site going down is not our takedown. Anything unclear is `unknown`, never `gone`. `GET /api/cases/{id}/liveness` returns the latest status per site.
+
+New environment variables: `PUBLIC_URL`, `PATROL_HOURS`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_SSL`, `EMAIL_FROM`, `EMAIL_REPLY_TO`, `ALERT_EMAIL_TO`, `ALERT_WEBHOOK_URL`, `ALERT_MIN_SEVERITY` (see `.env.example`). Not built: reading replies from registrars, multi-user login with roles, Anthropic provider.
+
 ### Brand API
 | Method | Path | |
 |---|---|---|

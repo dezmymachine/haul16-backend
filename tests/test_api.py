@@ -20,7 +20,8 @@ def client(db_url):
 
 def seed_notice(brand_id="brand_demo", status="drafted"):
     st = api.S.store
-    tid = st.add_threat(brand_id, "nkwaex-test.com", None, "manual", None, {"reasons": []})
+    import uuid
+    tid = st.add_threat(brand_id, f"nkwaex-test-{uuid.uuid4().hex[:6]}.com", None, "manual", None, {"reasons": []})
     case_id, _ = st.assign_case(tid, brand_id, "Suspected clone")
     st.add_notices(case_id, [{"channel": "google_safe_browsing", "channel_name": "Google Safe Browsing", "method": "web_form", "recipient": "https://x",
                               "recipient_verified": True, "subject": "s", "body": "b", "evidence_refs": {}}], tid)
