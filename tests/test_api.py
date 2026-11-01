@@ -202,3 +202,31 @@ def test_sweep_route_needs_protection_first(client):
     client.post(f"/api/brands/{bid}/activate")
     assert client.get(f"/api/brands/{bid}/sweep/status").json()["status"] == "running"
     assert client.post(f"/api/brands/{bid}/sweep").json()["status"] == "running"   # no duplicate job
+
+
+def test_edit_watch_terms_updates_live_detection(client):
+    b = client.post("/api/brands", json={"display_name": "Acme Pay", "website": "acmepay.test"}).json()
+    BrandRepo(api.S.store).update(b["id"], status="ready")
+    client.post(f"/api/brands/{b['id']}/activate")
+    assert api.S.watch.matcher.match("zorbex-login.com") is None
+    r = client.patch(f"/api/brands/{b['id']}", json={"seed_terms": ["Zorbex!", "ab", "zorbex"]}).json()
+    assert r["seed_terms"] == ["zorbex"]                                       # cleaned, short and duplicate terms dropped
+    assert api.S.watch.matcher.match("zorbex-login.com") is not None           # live matcher updated without a restart
+    assert client.patch(f"/api/brands/{b['id']}", json={"seed_terms": ["ab"]}).status_code == 422
+
+
+def test_next_action_puts_waiting_notices_ahead_of_housekeeping_once_protecting(client):
+    b = client.post("/api/brands", json={"display_name": "Acme Pay", "website": "acmepay.test"}).json()
+    bid = b["id"]
+    repo = BrandRepo(api.S.store)
+    repo.update(bid, status="ready")
+    repo.upsert_fact(bid, "phone", "0241112223", collector="website", origin="official")           # an unconfirmed detail
+    assert client.get(f"/api/brands/{bid}/setup").json()["next_action"]["key"] == "review_facts"     # before protection: finish the details
+    client.post(f"/api/brands/{bid}/activate")
+    assert client.get(f"/api/brands/{bid}/setup").json()["next_action"]["key"] == "review_facts"
+    tid = api.S.store.add_threat(bid, "acmepay-login.test", None, "manual", None, {"reasons": []})
+    case_id, _ = api.S.store.assign_case(tid, bid, "Suspected clone")
+    api.S.store.add_notices(case_id, [{"channel": "csa", "channel_name": "CSA", "method": "web_form", "recipient": "x", "recipient_verified": False,
+                                       "subject": "s", "body": "b", "evidence_refs": {}}], tid)
+    nxt = client.get(f"/api/brands/{bid}/setup").json()["next_action"]
+    assert nxt["key"] == "review_notices" and nxt["count"] == 1                                       # the notice outranks the pending detail

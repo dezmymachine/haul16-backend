@@ -73,3 +73,9 @@ def test_sweep_refuses_a_brand_detection_is_not_watching(watch):
     other = BrandRepo(store).create("Other Co", "other.test")["id"]
     with pytest.raises(RuntimeError, match="Start protection"):
         asyncio.run(run_sweep(store, w, other))
+
+
+def test_watch_terms_are_not_swept_as_standalone_domains():
+    c = generate_candidates("digba-tech.com", ["digba", "digbatech"], limit=2000)
+    assert "digba.com" not in c and "digba.net" not in c        # a different business with the same word, not a look-alike
+    assert "digba-tech.net" in c and "digbatech.com" in c        # but real variants of the domain still are

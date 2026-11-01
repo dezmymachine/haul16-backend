@@ -68,7 +68,10 @@ def label_variants(label: str) -> dict[str, list[str]]:
 
 
 def generate_candidates(domain: str, seed_terms: list[str] = (), exclude: set[str] = frozenset(), limit: int = 600) -> list[str]:
-    """Look-alike hostnames for a brand domain, interleaved across techniques so a cap keeps variety. Never includes `exclude`."""
+    """Look-alike hostnames for a brand domain, interleaved across techniques so a cap keeps variety. Never includes `exclude`.
+
+    Only variants of the domain itself. `seed_terms` is accepted but not swept as names: `<first word>.com` is usually a different,
+    legitimate business with the same word, and flagging it risks a wrongful takedown."""
     label, suffix = split_domain(domain)
     own = {domain_of(domain)} | {domain_of(e) for e in exclude}
     groups: list[list[str]] = []
@@ -82,9 +85,6 @@ def generate_candidates(domain: str, seed_terms: list[str] = (), exclude: set[st
                         hosts.append(h)
         groups.append(hosts)
     groups.append([f"{label}.{t}" for t in TLDS if t != suffix])                                   # same name, other TLD
-    for term in seed_terms:                                                                         # other registered names for the brand
-        if term and term != label:
-            groups.append([f"{term}.{suffix}", f"{term}.com", f"{term}.net"])
     seen, out = set(own), []
     for batch in zip_longest(*groups):
         for h in batch:

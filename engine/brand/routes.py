@@ -194,22 +194,48 @@ def setup_state(brand_id: str):
              "review": {"done": not undecided, "count": len(undecided)}, "ownership": {"done": verified}, "letter": {"done": letter},
              "protection": {"done": active}}
     wizard_step = 2 if not (ready and not undecided) else 3 if not (verified and letter) else 4
+    n_u = len(undecided)
+    review = {"key": "review_facts", "title": f"Confirm {n_u} detail{'s' if n_u != 1 else ''} we found", "detail": "Phone numbers, accounts and wallets are only used once you confirm them.", "href": "/setup?step=2", "count": n_u}
+    prove = {"key": "prove_ownership", "title": "Prove it's your brand", "detail": "Required before any notice can be filed: verify your domain and add the signed authorisation letter.", "href": "/setup?step=3"}
     if not ready:
         nxt = {"key": "wait_profile", "title": "Reading your brand's public footprint", "detail": "This takes about a minute. You can leave this page.", "href": "/setup?step=2"}
-    elif undecided:
-        nxt = {"key": "review_facts", "title": f"Confirm {len(undecided)} detail{'s' if len(undecided) != 1 else ''} we found", "detail": "Phone numbers, accounts and wallets are only used once you confirm them.", "href": "/setup?step=2", "count": len(undecided)}
-    elif not active:
-        nxt = {"key": "start_protection", "title": "Start protecting your brand", "detail": "HAUL16 will watch for look-alike sites and scan for ones that already exist.", "href": "/setup?step=4"}
-    elif awaiting:
+    elif not active:                      # still setting up: finish the details, then switch protection on
+        nxt = review if undecided else {"key": "start_protection", "title": "Start protecting your brand", "detail": "HAUL16 will watch for look-alike sites and scan for ones that already exist.", "href": "/setup?step=4"}
+    elif awaiting:                        # protecting: whatever is waiting on a person comes before housekeeping
         nxt = {"key": "review_notices", "title": f"Approve {awaiting} takedown notice{'s' if awaiting != 1 else ''}", "detail": "Each one needs a person to approve it before it can be filed.", "href": "/approvals", "count": awaiting}
     elif approved and verified and letter:
         nxt = {"key": "file_notices", "title": f"File {approved} approved notice{'s' if approved != 1 else ''}", "detail": "Filing is a dry run for now: nothing is sent, and the takedown clock starts.", "href": "/approvals?status=approved", "count": approved}
-    elif approved or not (verified and letter):
-        nxt = {"key": "prove_ownership", "title": "Prove it's your brand", "detail": "Required before any notice can be filed: verify your domain and add the signed authorisation letter.", "href": "/setup?step=3"}
+    elif approved:
+        nxt = prove                       # something is ready to file but filing is locked
+    elif undecided:
+        nxt = review
+    elif not (verified and letter):
+        nxt = prove
     else:
         nxt = {"key": "all_clear", "title": "All clear", "detail": "Nothing needs you right now. HAUL16 keeps watching.", "href": "/home"}
     return {"brand_id": brand_id, "step": wizard_step, "complete": active, "steps": steps, "next_action": nxt, "sweep": _sweep(brand_id),
             "counts": {"threats": len(STATE.store.threats(brand_id, limit=100000)), "awaiting": awaiting, "approved": approved}}
+
+
+class BrandPatch(BaseModel):
+    seed_terms: list[str] | None = Field(default=None, max_length=20)
+
+
+@router.patch("/{brand_id}")
+def patch_brand(brand_id: str, body: BrandPatch):
+    """Edit the names detection looks for. Lowercase letters and digits only, at least 4 characters (shorter flood the queue)."""
+    b = _need(brand_id)
+    if body.seed_terms is not None:
+        terms = list(dict.fromkeys(t for t in ("".join(c for c in x.lower() if c.isalnum()) for x in body.seed_terms) if len(t) >= 4))
+        if not terms:
+            raise HTTPException(422, "Add at least one name of 4 or more letters or digits")
+        repo().update(brand_id, seed_terms=terms)
+        STATE.store.audit("operator", "seed_terms_updated", brand_id, {"seed_terms": terms})
+        if STATE.watch.brand.brand_id == brand_id:        # live detection picks the change up straight away
+            brand, cfg = brand_from_db(repo(), brand_id)
+            STATE.watch.set_brand(brand, cfg)
+            STATE.pipe.matcher = STATE.watch.matcher
+    return _public(repo().get(brand_id) or b)
 
 
 @router.delete("/{brand_id}")
