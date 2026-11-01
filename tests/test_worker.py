@@ -35,6 +35,10 @@ def test_watch_links_campaign_and_skips_decoy(server, store):  # noqa: F811
     assert actions.count("case_opened") == 1
     assert "threat_linked_to_case" in actions
 
+    # High-confidence finds raise one alert each (deduped per threat); the low-risk decoy raises none.
+    found = store.db.execute("SELECT title, severity FROM alerts WHERE kind='finding' ORDER BY id").fetchall()
+    assert sorted(r["title"] for r in found) == ["High-confidence look-alike: nkwaex-airdrop.top", "High-confidence look-alike: nkwaex-support.com"]
+
     # Notices are drafted per channel from evidence, never filed automatically.
     case = store.case(r[a]["case_id"])
     channels = {n["channel"] for n in case["notices"]}

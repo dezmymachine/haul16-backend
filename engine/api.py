@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from engine import auth, ct_poll, jobs, notices
+from engine import alerts, auth, ct_poll, discovery, jobs, notices, patrol
 from engine.brand import routes as brand_routes
 from engine.brand.import_yaml import import_yaml
 from engine.brand.loader import NO_BRAND, brand_from_db
@@ -107,6 +107,7 @@ async def lifespan(app: FastAPI):
     tasks.append(asyncio.create_task(stats_ticker()))
     if SETTINGS.embedded_worker:
         tasks.append(asyncio.create_task(jobs.run_worker(S.store, job_handlers(S.store, S.watch))))
+    tasks.append(asyncio.create_task(patrol.patrol_loop(S.store, S.watch)))
     if CT_ENABLED:
         tasks.append(asyncio.create_task(ct_loop()))
     yield
@@ -145,6 +146,49 @@ def health():
             "collectors": {"llm": bool(SETTINGS.openai_api_key if SETTINGS.llm_provider == "openai" else SETTINGS.anthropic_api_key),
                            "firecrawl": bool(SETTINGS.firecrawl_api_key), "apify": bool(SETTINGS.apify_token and SETTINGS.apify_linkedin_actor),
                            "search": bool(SETTINGS.search_api_key), "urlscan": bool(SETTINGS.urlscan_api_key)}}
+
+
+# ---- alerts and settings ------------------------------------------------------
+
+@app.get("/api/alerts")
+def alerts_list(unread: bool = False, limit: int = 50, b: str = Depends(bid)):
+    return {"unread": alerts.unread_count(S.store, b), "items": alerts.list_alerts(S.store, b, unread, min(limit, 200))}
+
+
+class ReadIn(BaseModel):
+    ids: list[int] | None = None
+
+
+@app.post("/api/alerts/read")
+def alerts_read(body: ReadIn, b: str = Depends(bid)):
+    return {"marked": alerts.mark_read(S.store, b, body.ids), "unread": alerts.unread_count(S.store, b)}
+
+
+@app.post("/api/alerts/test")
+async def alerts_test(b: str = Depends(bid)):
+    """Send a test alert through every configured channel, so the person can see that email and webhook really arrive."""
+    import time as _t
+    a = await alerts.notify(S.store, b, "test", "Test alert from HAUL16", "If you can read this, this channel works.", "/home", "high", ref=f"test-{_t.time_ns()}")
+    cfg = get_settings()
+    return {"id": a["id"], "delivered": a.get("delivered") or {}, "channels": {"webhook": bool(cfg.alert_webhook_url), "email": bool(cfg.alert_email_to and cfg.smtp_host)}}
+
+
+@app.get("/api/sources")
+def sources_list():
+    return discovery.source_catalog(S.store)
+
+
+class SourceToggle(BaseModel):
+    enabled: bool
+
+
+@app.put("/api/sources/{sid}")
+def source_toggle(sid: str, body: SourceToggle):
+    if sid not in discovery.SOURCES:
+        raise HTTPException(404, "No such source")
+    S.store.db.execute("INSERT INTO source_toggles (collector, enabled) VALUES (?,?) ON CONFLICT (collector) DO UPDATE SET enabled=EXCLUDED.enabled", (sid, body.enabled))
+    S.store.audit("operator", "source_toggled", sid, {"enabled": body.enabled})
+    return next(c for c in discovery.source_catalog(S.store) if c["id"] == sid)
 
 
 @app.get("/api/brand")

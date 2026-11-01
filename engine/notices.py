@@ -29,6 +29,8 @@ CLAIM_TEXT = {
     "brand_name_exact_label": "The hostname uses {brand}'s name on a domain {brand} does not own ({v}).",
     "brand_name_in_domain": "The hostname contains {brand}'s name ({v}).",
     "brand_plus_lure_word": "The hostname combines {brand}'s name with a lure word ({v}).",
+    "handle_lookalike": "The account name {v} imitates {brand}'s name.",
+    "social_link_submitted": "This social account was reported to us as impersonating {brand} ({v}).",
     "free_hosting_subdomain": "The page sits on a free hosting subdomain ({v}).",
 }
 
@@ -97,6 +99,8 @@ def facts_for(threat: dict, brand, brand_cfg: dict, case_id: str) -> dict:
         "letter_ref": letter_ref,
         "letter_sha256": letter_sha,
         "case_id": case_id,
+        "is_social": threat["hostname"].startswith(("t.me/", "chat.whatsapp.com/")),
+        "handle": threat["hostname"].split("/", 1)[-1],
     }
 
 
@@ -104,6 +108,9 @@ def applies(rule: str, f: dict) -> bool:
     phones = f["phone_list"]
     return {
         "has_url": f["url"] != "unknown",
+        "has_web_url": f["url"] != "unknown" and not f["is_social"],
+        "is_telegram": f["host"].startswith("t.me/"),
+        "is_whatsapp": f["host"].startswith("chat.whatsapp.com/"),
         "has_registered_domain": f["registered_domain"] != "unknown",
         "has_hosting": f["network"] != "unknown",
         "has_payment_identifier": bool(phones or f["wallet_list"]),

@@ -17,7 +17,8 @@ from urllib.parse import urlparse
 from engine import ct_poll, notices
 from engine.capture import capture
 from engine.extract import Identifiers, unofficial
-from engine.matcher import Brand, Matcher
+from engine.matcher import Brand, Candidate, Matcher
+from engine.social_hosts import capture_urls, is_social, social_host
 from engine.pipeline import Pipeline
 from engine.rdap import enrich
 from engine.score import score
@@ -70,14 +71,49 @@ class Watch:
 
     def inject(self, url: str, as_host: str | None = None, source: str = "manual",
                allow_local: bool | None = None) -> str | None:
-        host = as_host or urlparse(url).hostname or url
-        cand = self.matcher.match(host)
+        host = as_host or social_host(url) or urlparse(url).hostname or url
+        cand = self.matcher.match(host) or self.social_candidate(host)
         tid = self.store.add_threat(self.brand.brand_id, host, url, source, None, asdict(cand) if cand else None)
         if tid:
             self.publish({"type": "hit", "threat_id": tid, "host": host, "priority": cand.priority if cand else 0,
                           "reasons": cand.reasons if cand else [], "source": source})
             self.queue.put_nowait((tid, host, url, self.allow_local if allow_local is None else allow_local))
         return tid
+
+    def social_candidate(self, host: str) -> Candidate | None:
+        """Stage A for a Telegram or WhatsApp link: does the handle contain one of the brand's names?"""
+        if not is_social(host):
+            return None
+        words = [w for w in self.brand.seed_terms if len(w) >= 4]
+        slug = host.split("/", 1)[1].lower().replace("_", "")
+        hit = next((w for w in words if w in slug), None)
+        if hit:
+            return Candidate(hostname=host, display=host, seed=hit, reasons=["handle_lookalike"], priority=35)
+        return Candidate(hostname=host, display=host, seed="", reasons=["social_link_submitted"], priority=10)
+
+    async def assess_social(self, host: str, cap, enr: dict) -> dict:
+        """Public-page facts about the account or group, observed only (never joined): Telegram preview, and any WhatsApp invite links the page shows."""
+        from engine.clients import telegram, whatsapp
+        from engine.clients.base import new_client
+        try:
+            async with new_client(timeout=20) as http:
+                if host.startswith("t.me/"):
+                    pv = await telegram.preview(http, host.split("/", 1)[1])
+                    if pv:
+                        enr = {**enr, "telegram": pv}
+                codes = [c for c in (cap.identifiers or {}).get("whatsapp", []) if whatsapp.INVITE.search(f"chat.whatsapp.com/{c}")] if cap else []
+                if host.startswith("chat.whatsapp.com/"):
+                    codes.append(host.split("/", 1)[1])
+                groups = []
+                for code in list(dict.fromkeys(codes))[:5]:
+                    g = await whatsapp.preview(http, code)
+                    if g:
+                        groups.append(g)
+                if groups:
+                    enr = {**enr, "whatsapp_groups": groups}
+        except Exception:  # noqa: BLE001  assessment is extra evidence, never a reason to fail the capture
+            pass
+        return enr
 
     def recover(self) -> int:
         """Put threats left in 'queued' (a restart mid-pipeline) back on the capture queue. Makes the in-process queue durable."""
@@ -91,18 +127,23 @@ class Watch:
 
     async def process(self, tid: str, host: str, url: str | None, allow_local: bool | None = None) -> dict:
         allow_local = self.allow_local if allow_local is None else allow_local
-        urls = [url] if url else [f"https://{host}/", f"http://{host}/"]
+        social = is_social(host)
+        urls = capture_urls(host) if social else ([url] if url else [f"https://{host}/", f"http://{host}/"])
         cap = None
         for u in urls:
             cap = await capture(u, allow_local=allow_local)
             if cap.html_sha256:
                 break
-        if self.enrich_hosts:
+        enr: dict = {"host": host, "platform": "telegram" if host.startswith("t.me/") else "whatsapp"} if social else {}
+        if self.enrich_hosts and not social:
             try:
-                self.store.save_enrichment(tid, await enrich(host))
+                enr = await enrich(host)
             except Exception as e:                       # enrichment is optional evidence
-                self.store.save_enrichment(tid, {"host": host, "error": repr(e)[:200]})
-        cand = self.matcher.match(host)
+                enr = {"host": host, "error": repr(e)[:200]}
+        if self.enrich_hosts:
+            enr = await self.assess_social(host, cap, enr)
+            self.store.save_enrichment(tid, enr)
+        cand = self.matcher.match(host) or self.social_candidate(host)
         verdict = score(self.brand, cand, cap)
         self.store.save_result(tid, asdict(cap), asdict(verdict))
 
@@ -131,6 +172,13 @@ class Watch:
                     self.retry_after[n], self.queue.put_nowait, (tid, host, url, allow_local))
         print("SCORED " + json.dumps(result), flush=True)
         self.publish({"type": "scored", **result})
+        if verdict.confidence in ("high", "medium"):
+            from engine import alerts
+            links = f" Joined case via {', '.join(result['linked_via'])}." if result.get("linked_via") else (" Opened a case." if result.get("case_id") else "")
+            await alerts.notify(
+                self.store, self.brand.brand_id, "finding", f"{verdict.confidence.title()}-confidence look-alike: {host}",
+                f"Score {verdict.score}. {', '.join(verdict.reason_codes)}.{links} {result.get('notices_drafted', 0)} notice(s) drafted for approval.",
+                f"/cases/{result['case_id']}" if result.get("case_id") else f"/threats/{tid}", verdict.confidence, ref=tid)
         return result
 
     async def capture_worker(self) -> None:

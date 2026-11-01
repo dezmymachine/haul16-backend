@@ -101,6 +101,38 @@ async def resolves(host: str, records=dnsx.records) -> bool:
     return bool(await records(host, "A") or await records(host, "AAAA") or await records(host, "NS"))
 
 
+async def dns_lookalike_hosts(domains: list[str], seed_terms: list[str], exclude: set[str], records=dnsx.records, concurrency: int = 25, progress=None) -> tuple[list[str], dict]:
+    """Generate variants of every domain and return the ones that resolve, plus counters {generated, checked, registered}."""
+    candidates: list[str] = []
+    for dom in domains:
+        for h in generate_candidates(dom, seed_terms, exclude, limit=600):
+            if h not in candidates:
+                candidates.append(h)
+    state = {"generated": len(candidates), "checked": 0, "registered": 0}
+    if progress:
+        progress(dict(state))
+    sem = asyncio.Semaphore(concurrency)
+    live: list[str] = []
+
+    async def check(h: str):
+        async with sem:
+            try:
+                ok = await resolves(h, records)
+            except Exception:  # noqa: BLE001  a resolver hiccup is "unknown", not a failure of the sweep
+                ok = False
+        state["checked"] += 1
+        if ok:
+            live.append(h)
+            state["registered"] = len(live)
+        if progress and state["checked"] % 20 == 0:
+            progress(dict(state))
+
+    await asyncio.gather(*(check(h) for h in candidates))
+    if progress:
+        progress(dict(state))
+    return live, state
+
+
 async def run_sweep(store, watch, brand_id: str, progress=None, records=dnsx.records, max_inject: int = 40, concurrency: int = 25) -> dict:
     """Generate, resolve, and inject. `records` is injectable so tests need no network."""
     repo = BrandRepo(store)

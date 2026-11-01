@@ -22,13 +22,19 @@ def handlers(store: Store, watch=None) -> dict:
             raise
     out = {"brand_profile": brand_profile}
     if watch is not None:        # the sweep feeds the live pipeline, so it runs where the Watch queue lives (the API process)
-        from engine.sweep import run_sweep
+        from engine.discovery import run_discovery
 
         async def lookalike_sweep(job: dict) -> dict:
             def progress(state: dict) -> None:
                 store.db.execute("UPDATE jobs SET result=? WHERE id=?", (__import__("json").dumps(state), job["id"]))
-            return await run_sweep(store, watch, job["brand_id"], progress)
-        out["lookalike_sweep"] = lookalike_sweep
+            res = await run_discovery(store, watch, job["brand_id"], progress)
+            if res.get("queued"):
+                from engine import alerts
+                found = ", ".join(f"{v.get('queued')} from {v['label'].lower()}" for v in res["sources"].values() if v.get("queued"))
+                await alerts.notify(store, job["brand_id"], "scan_done", f"Scan found {res['queued']} new thing{'s' if res['queued'] != 1 else ''} to analyse", found, "/threats",
+                                    "info", ref=f"scan-{job['id']}")
+            return res
+        out["discovery"] = lookalike_sweep
     return out
 
 

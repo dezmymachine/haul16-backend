@@ -19,6 +19,19 @@ class Settings(BaseSettings):
     auth_owner_name: str | None = None
     auth_owner_password: str | None = None
     session_secret: str | None = None
+    public_url: str = "http://127.0.0.1:5173"  # the frontend's address, used to build links in emails and webhooks
+    patrol_hours: int = 6                     # how often an active brand is scanned again. 0 turns patrols off
+    # Email (alerts now, notice sending in dry-run=false mode) and webhooks. All optional.
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_user: str | None = None
+    smtp_password: str | None = None
+    smtp_ssl: bool = False                    # true = implicit TLS (port 465); false = STARTTLS when the server offers it
+    email_from: str = "haul16@localhost"
+    email_reply_to: str | None = None
+    alert_email_to: str | None = None         # comma separated
+    alert_webhook_url: str | None = None      # Slack incoming webhook or any URL that accepts JSON with a "text" field
+    alert_min_severity: str = "medium"        # info | medium | high: the least severe alert sent outside the app
     embedded_worker: bool = True              # run the job worker inside the API process (set false when a separate worker service runs)
     haul16_dry_run: bool = True               # nothing is ever sent while true
     frontend_origins: str = "http://localhost:5173,http://127.0.0.1:5173"

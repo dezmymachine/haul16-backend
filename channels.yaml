@@ -62,7 +62,7 @@ channels:
 
   - id: google_safe_browsing
     name: Google Safe Browsing
-    applies_when: has_url
+    applies_when: has_web_url
     method: web_form
     recipient: "https://safebrowsing.google.com/safebrowsing/report_phish/"
     verified: true
@@ -143,3 +143,44 @@ channels:
       What we observed:
       {claims}
       Evidence captured {captured_at} UTC (page SHA-256 {html_sha256}).
+
+  - id: telegram
+    name: Telegram abuse reports
+    applies_when: is_telegram
+    method: email
+    recipient: "abuse@telegram.org"
+    verified: false         # [VERIFY] Telegram's current reporting route. In-app "Report" on the channel is the other option.
+    expected_response: "Unknown. Telegram reviews reports of impersonation and scams; no stated timescale. We will measure it."
+    evidence_checklist: [url, screenshot, page_hash, authorisation_letter]
+    subject: "Impersonation report: {url} claims to be {brand}"
+    body: |
+      To the Telegram abuse team,
+
+      We act as authorised agent for {brand} (official site: {brand_domain}). Our signed authorisation letter
+      is attached (SHA-256 {letter_sha256}).
+
+      The public account or channel {url} (handle {handle}) presents itself as {brand} and is not operated by {brand}.
+
+      What we observed:
+      {claims}
+
+      Evidence captured {captured_at} UTC: page SHA-256 {html_sha256}, screenshot SHA-256 {screenshot_sha256}.
+
+      We ask you to review the account under your terms on impersonation and fraud.
+
+  - id: whatsapp
+    name: WhatsApp impersonation report
+    applies_when: is_whatsapp
+    method: web_form
+    recipient: "https://www.whatsapp.com/contact/?subject=messenger"
+    verified: false         # [VERIFY] the correct brand-protection route for authorised agents
+    expected_response: "Unknown. We will measure it."
+    evidence_checklist: [url, screenshot, page_hash, authorisation_letter]
+    subject: "Impersonation report: {url} claims to be {brand}"
+    body: |
+      Group invite: {url}
+      Impersonated brand: {brand} ({brand_domain})
+      Authorised agent letter SHA-256: {letter_sha256}
+      What we observed:
+      {claims}
+      Evidence captured {captured_at} UTC: page SHA-256 {html_sha256}, screenshot SHA-256 {screenshot_sha256}.

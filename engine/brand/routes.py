@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from engine import jobs
+from engine import jobs, patrol
 from engine.brand import verify
 from engine.brand.loader import NO_BRAND, brand_from_db
 from engine.brand.repo import BrandRepo
@@ -34,8 +34,8 @@ def _need(brand_id: str) -> dict:
 
 
 def _public(b: dict) -> dict:
-    return {k: b[k] for k in ("id", "display_name", "website", "linkedin_url", "status", "ownership_status", "verified_at", "fictional",
-                              "authorisation_letter_ref", "authorisation_letter_sha256", "seed_terms", "active_version", "is_active", "created_at", "updated_at")}
+    return {"patrol_hours": patrol.interval_hours(b), **{k: b[k] for k in ("id", "display_name", "website", "linkedin_url", "status", "ownership_status", "verified_at", "fictional",
+                              "authorisation_letter_ref", "authorisation_letter_sha256", "seed_terms", "active_version", "is_active", "created_at", "updated_at")}}
 
 
 def _job(brand_id: str) -> dict | None:
@@ -149,14 +149,14 @@ def upload_letter(brand_id: str, body: LetterIn):
 
 
 def _sweep(brand_id: str) -> dict:
-    j = jobs.latest(STATE.store, "lookalike_sweep", brand_id)
+    j = jobs.latest(STATE.store, "discovery", brand_id)
     if not j:
         return {"status": "none"}
     res = j["result"] or {}
     return {"job_status": j["status"], "status": "done" if j["status"] == "done" else ("failed" if j["status"] == "failed" else "running"),
             "error": j["last_error"], "updated_at": j["updated_at"], "phase": res.get("phase", "queued"), "generated": res.get("generated", 0),
             "checked": res.get("checked", 0), "registered": res.get("registered", 0), "queued": res.get("queued", 0),
-            "skipped_known": res.get("skipped_known", 0)}
+            "skipped_known": res.get("skipped_known", 0), "sources": res.get("sources", {})}
 
 
 @router.post("/{brand_id}/sweep")
@@ -169,7 +169,7 @@ def run_sweep_route(brand_id: str):
     cur = _sweep(brand_id)
     if cur["status"] == "running":
         return cur
-    jobs.enqueue(STATE.store, "lookalike_sweep", brand_id, {}, max_attempts=1)
+    jobs.enqueue(STATE.store, "discovery", brand_id, {}, max_attempts=1)
     return _sweep(brand_id)
 
 
@@ -214,11 +214,13 @@ def setup_state(brand_id: str):
     else:
         nxt = {"key": "all_clear", "title": "All clear", "detail": "Nothing needs you right now. HAUL16 keeps watching.", "href": "/home"}
     return {"brand_id": brand_id, "step": wizard_step, "complete": active, "steps": steps, "next_action": nxt, "sweep": _sweep(brand_id),
+            "patrol": {"hours": patrol.interval_hours(b), "next_at": (n.isoformat(timespec="seconds") if (n := patrol.next_scan(STATE.store, b)) else None)},
             "counts": {"threats": len(STATE.store.threats(brand_id, limit=100000)), "awaiting": awaiting, "approved": approved}}
 
 
 class BrandPatch(BaseModel):
     seed_terms: list[str] | None = Field(default=None, max_length=20)
+    patrol_hours: int | None = Field(default=None, ge=0, le=168)         # 0 turns scheduled scans off
 
 
 @router.patch("/{brand_id}")
@@ -235,6 +237,10 @@ def patch_brand(brand_id: str, body: BrandPatch):
             brand, cfg = brand_from_db(repo(), brand_id)
             STATE.watch.set_brand(brand, cfg)
             STATE.pipe.matcher = STATE.watch.matcher
+    if body.patrol_hours is not None:
+        cur = repo().get(brand_id)
+        repo().update(brand_id, inputs={**(cur["inputs"] or {}), "patrol_hours": body.patrol_hours})
+        STATE.store.audit("operator", "patrol_interval_set", brand_id, {"hours": body.patrol_hours})
     return _public(repo().get(brand_id) or b)
 
 
@@ -261,5 +267,5 @@ def activate(brand_id: str):
     STATE.store.db.execute("UPDATE brands SET is_active=(id=?)", (brand_id,))
     STATE.store.audit("operator", "brand_activated", brand_id)
     if _sweep(brand_id)["status"] != "running":        # protection starts with a look-alike scan so there is something to review
-        jobs.enqueue(STATE.store, "lookalike_sweep", brand_id, {}, max_attempts=1)
+        jobs.enqueue(STATE.store, "discovery", brand_id, {}, max_attempts=1)
     return {"active": brand_id, "sweep": _sweep(brand_id)}

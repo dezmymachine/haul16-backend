@@ -9,7 +9,10 @@ os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
 os.environ["HAUL16_CT"] = "0"
 os.environ["EMBEDDED_WORKER"] = "false"
 os.environ["SEED_DEMO_BRAND"] = "true"          # API tests use the fictional demo brand; one test turns it off
-for _k in ("OPENAI_API_KEY", "FIRECRAWL_API_KEY", "APIFY_TOKEN", "SEARCH_API_KEY", "URLSCAN_API_KEY"):
+# Whatever is in a developer's .env (sign-in, keys, SMTP, webhooks) must never change test behaviour.
+os.environ["HAUL16_ENV"] = "dev"
+for _k in ("OPENAI_API_KEY", "FIRECRAWL_API_KEY", "APIFY_TOKEN", "SEARCH_API_KEY", "URLSCAN_API_KEY", "META_AD_LIBRARY_TOKEN",
+           "AUTH_OWNER_PASSWORD", "SESSION_SECRET", "SMTP_HOST", "ALERT_WEBHOOK_URL", "ALERT_EMAIL_TO"):
     os.environ[_k] = ""          # tests never call real vendors; collectors without a key skip
 
 from engine.db import Database, can_connect, migrate
@@ -17,7 +20,7 @@ from engine.settings import get_settings
 from engine.store import Store
 
 TABLES = ("threats", "cases", "identifiers", "notices", "clock_events", "audit_log", "brands", "brand_profile_versions",
-          "brand_facts", "brand_assets", "brand_people", "jobs", "signals", "llm_calls", "source_toggles")
+          "brand_facts", "brand_assets", "brand_people", "jobs", "signals", "llm_calls", "source_toggles", "alerts")
 
 
 def _test_url() -> str:
@@ -46,3 +49,9 @@ def store(db_url):
     s.db.execute("TRUNCATE " + ", ".join(TABLES) + " RESTART IDENTITY")
     yield s
     s.db.close()
+
+
+@pytest.fixture(autouse=True)
+def _no_politeness_delay(monkeypatch):
+    from engine import social
+    monkeypatch.setattr(social, "POLITE_DELAY", 0)
