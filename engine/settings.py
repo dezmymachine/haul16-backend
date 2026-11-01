@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     haul16_env: str = "dev"                   # dev | prod (prod turns demo routes off)
     haul16_port: int = 8000
     haul16_ct: bool = True                    # follow CT logs inside the API process
+    embedded_worker: bool = True              # run the job worker inside the API process (set false when a separate worker service runs)
     haul16_dry_run: bool = True               # nothing is ever sent while true
     frontend_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
@@ -30,6 +31,7 @@ class Settings(BaseSettings):
     firecrawl_api_key: str | None = None
     apify_token: str | None = None
     apify_linkedin_actor: str | None = None   # Apify actor id for LinkedIn company pages, e.g. "owner~actor-name"
+    apify_linkedin_input: str = '{"startUrls":[{"url":"{url}"}]}'  # JSON actor input; {url} is replaced
     apify_social_actor: str | None = None     # Apify actor id for generic public social profile lookups
     search_provider: str = "brave"
     search_api_key: str | None = None

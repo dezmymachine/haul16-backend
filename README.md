@@ -22,10 +22,93 @@ version needs: data sources and APIs, services, accounts and keys, infrastructur
 standards, channels, demo plan, and which claims are `[VERIFIED]`, `[ASSUMPTION]` or `[UNVERIFIED]`) is in
 [`docs/HAUL16-brief.md`](docs/HAUL16-brief.md). Read it when a product question is not answered here.
 
-This repo is the **backend** (Python 3.12+, FastAPI, SQLite, Playwright). The operator console is a
+This repo is the **backend** (Python 3.12+, FastAPI, Postgres, Playwright). The operator console is a
 separate repo: **[dezmymachine/haul16-frontend](https://github.com/dezmymachine/haul16-frontend)**
 (TanStack Start + shadcn/ui). If you are an agent picking this up, read this file fully; the
 "Invariants" and "How to extend" sections matter most.
+
+---
+
+## 0. The `live` branch (read this first if you are on it)
+
+`main` is the dry-run demo on SQLite. **`live` turns HAUL16 into a brand-aware agent**: you give it a brand, it builds a sourced,
+versioned identity dossier for that brand from everything public, and detection then runs against that dossier instead of a
+hand-written `brand.yaml`. Design and rationale: the plan in the repo history and `docs/HAUL16-brief.md`. Status of Milestone 1:
+
+| Area | State on `live` |
+|---|---|
+| Postgres (Neon-ready) + Alembic migrations | **Done.** `engine/db.py`, `migrations/`, `engine/store.py` ported; all original tests pass on Postgres |
+| Settings from env | **Done.** `engine/settings.py`, `.env.example` |
+| Durable job queue (Postgres `SKIP LOCKED`) | **Done.** `engine/jobs.py`; runs in the API process (`EMBEDDED_WORKER=true`) or as `python -m engine.worker_main` |
+| Capture queue durability | Threats left `queued` by a restart are re-queued on boot (`Watch.recover()`); the in-process asyncio queue itself is kept |
+| Brand Profiler (dossier) | **Done.** `engine/brand/` (see below); every collector skips cleanly without its key |
+| Brand API (create, profile, verify, review facts, letter upload, activate) | **Done.** `engine/brand/routes.py` |
+| Detection reads the dossier | **Done.** `engine/brand/loader.py`; the active brand is chosen with `POST /api/brands/{id}/activate` |
+| Brand-scoped reads | **Done.** `?brand_id=` or `X-Brand-Id` header on stats, threats, cases, notices, report, brand |
+| LLM adapter | **Done for OpenAI** (`engine/llm.py`); Anthropic is a stub that raises `NotConfigured`, add it in `_chat` |
+| Docker / Railway | `Dockerfile`, `railway.json`, `.dockerignore` added. See "Deploying" |
+| CT follower as its own process with a saved cursor | **Not done.** CT polling still runs inside the API process (`HAUL16_CT`) |
+| urlscan, Meta Ad Library, Telegram/WhatsApp assessment, agent loop, alerts, auth, real senders | **Not started** (Milestones 2 to 5 in the plan) |
+
+### Run it locally
+```bash
+docker run -d --name haul16-pg -e POSTGRES_USER=haul16 -e POSTGRES_PASSWORD=haul16 -e POSTGRES_DB=haul16 -p 127.0.0.1:55433:5432 postgres:16-alpine
+cp .env.example .env            # add keys as you get them; none are required to start
+uv sync && uv run playwright install chromium
+uv run uvicorn engine.api:app --port 8000     # migrates the database and seeds the fictional demo brand on first start
+uv run pytest -q                              # creates and uses a separate haul16_test database
+```
+Neon: set `DATABASE_URL` to the Neon connection string (it needs `?sslmode=require`) and, for tests, `TEST_DATABASE_URL` to a Neon **branch**.
+
+### The Brand Profiler (`engine/brand/`)
+`POST /api/brands/{id}/profile/run` queues a `brand_profile` job; any worker runs `profiler.run_profile`. Collectors, in order, each isolated
+(a missing key or vendor outage marks that step `skipped` or `error` and the profile still completes; progress is on the job row, read it with
+`GET /api/brands/{id}/profile/status`):
+
+| Step | What it collects | Needs |
+|---|---|---|
+| `inputs` | what the person typed: domain, LinkedIn/social URLs, extra domains (confirmed, origin `user`) | nothing |
+| `dns` | A, NS, MX, SPF, email provider | nothing |
+| `rdap` | registrar, creation date, hosting network, abuse contacts | nothing |
+| `website` | home page plus about/contact/team/terms/legal pages: text, socials, phones, emails, app links, wallets, JSON-LD organisation, founders | nothing (Firecrawl, if keyed, supplies the page text and `map`) |
+| `assets` | logo and favicon files: sha256, perceptual hash (`imagehash`), favicon mmh3. Only the company's own logo (header/nav or named after the brand), never partner logos | nothing |
+| `linkedin` | company page facts (followers, employees, tagline, site) and key people | `APIFY_TOKEN`, `APIFY_LINKEDIN_ACTOR`, `APIFY_LINKEDIN_INPUT` |
+| `socials` | public Telegram channel previews (no login, no joining); other platforms via an Apify actor | nothing for Telegram; `APIFY_SOCIAL_ACTOR` for the rest |
+| `news` | press mentions and "scam/fake/phishing" warnings that name the brand | `SEARCH_API_KEY` (Brave) |
+| `dossier` | LLM extraction of legal names, registration numbers, licences, addresses, leadership, official contacts, payment instructions, a summary | `OPENAI_API_KEY` |
+
+Every fact is a row in `brand_facts` (`kind`, `value`, `source_url`, `collector`, `confidence`, `verification`, `review_status`). Verification is
+computed in `BrandRepo.upsert_fact`: `verified` (the brand's own site and an independent source agree, or a person entered it), `corroborated`
+(own site only), `single_source` (third party only), `conflicting` (two different values for a singular fact such as a registration number).
+**Phones, wallets, bank accounts and social handles are never used for detection until a person confirms them** (`needs_confirmation`); the
+matcher and scorer read only confirmed numbers and wallets, and domains that are confirmed or backed by the brand's own site
+(`BrandRepo.detection_inputs`, `engine/brand/loader.py`). The profile is versioned (`brand_profile_versions`).
+
+Safety built in:
+- **SSRF:** every outbound request, including redirects, is checked against private/internal addresses in `engine/clients/base.py` (`new_client`), so a brand "website" cannot point the server at internal services. `base.ALLOW_PRIVATE` is for tests only.
+- **LLM:** `engine/llm.py` wraps page text in an untrusted-data guard, validates output against a pydantic schema (one repair retry), logs a hash of every call to `llm_calls`, and `engine/brand/dossier.py` keeps only items that cite a supplied URL **and** literally appear in that page. The model never writes notice text and never sees tools.
+- **Ownership:** `POST /api/brands/{id}/verify` checks a DNS TXT record (`_haul16-verify.<domain>` or the domain itself) containing the brand's token. No verified owner, no filings (to be enforced on the file route in the auth milestone).
+- **Kill switches:** insert `(collector, FALSE)` into `source_toggles` to disable a collector without a deploy.
+
+### Brand API
+| Method | Path | |
+|---|---|---|
+| GET/POST | `/api/brands` | list; create (`display_name` plus `website` or `linkedin_url`, optional `socials`, `extra_domains`). Returns the verification record to add |
+| GET | `/api/brands/{id}` | brand, verification instructions, latest job |
+| POST | `/api/brands/{id}/profile/run` | queue profiling (no duplicate while one is queued/running) |
+| GET | `/api/brands/{id}/profile` | facts grouped by kind, people, assets, version summary, `needs_review` and conflict ids |
+| GET | `/api/brands/{id}/profile/status` | job progress per step |
+| POST | `/api/brands/{id}/verify` | check the DNS ownership record |
+| POST | `/api/brands/{id}/facts/{fact_id}/confirm` or `/reject` | human review |
+| POST | `/api/brands/{id}/letter` | `{filename, content_base64}`; stores the SHA-256 used in notices |
+| POST | `/api/brands/{id}/activate` | point the CT matcher and capture workers at this brand |
+Other routes accept `?brand_id=` or the `X-Brand-Id` header and default to the active brand. `GET /api/health` reports `db`, `jobs_pending` and which collectors are configured (booleans only).
+
+### Deploying (Railway + Neon)
+Two services from this repo's Dockerfile (branch `live`): **api** (default start command, `HAUL16_ENV=prod`, `EMBEDDED_WORKER=false`) and **worker**
+(start command `python -m engine.worker_main`). Set `DATABASE_URL` (Neon), `FRONTEND_ORIGINS` (the Vercel URL), `HAUL16_ENV=prod`, and the collector keys.
+`HAUL16_ENV=prod` turns `/demo-sites` and the demo routes off. `GET /api/health` is the health check. The first start applies migrations and seeds the
+fictional demo brand if no brand exists; in production create the real brand through the API and activate it.
 
 ---
 
@@ -62,7 +145,7 @@ Environment variables (all optional):
 CORS allows only `http://localhost:5173` and `http://127.0.0.1:5173` (the frontend dev server). Change
 it in `engine/api.py` if the frontend runs elsewhere.
 
-State lives in `data/` (git-ignored, created on first run): `haul16.db` (SQLite, WAL),
+State lives in Postgres (`DATABASE_URL`) and, locally, in `data/` (git-ignored, created on first run):
 `evidence/` (screenshots `.png` and page source `.html`), `hits.jsonl` (raw Stage A hits), `logs/`.
 
 ### Running both repos together
@@ -86,7 +169,7 @@ as above, then in the frontend repo `npm install && npm run dev` and open http:/
                                    |
         capture.py (Stage B) -> rdap.py (enrich) -> score.py (Stage C)
                                    |
-                  store.py (SQLite): threats, identifiers, cases, notices, clock, audit
+                  store.py (Postgres): threats, identifiers, cases, notices, clock, audit
                                    |
                   notices.py + channels.yaml  (draft notices; templates only)
                                    |
@@ -103,7 +186,7 @@ as above, then in the frontend repo `npm install && npm run dev` and open http:/
 | `engine/extract.py` | Regex extraction of Ghana phone numbers, TRON/ETH/BTC wallets, Telegram, WhatsApp; `unofficial()` diffs against the brand register |
 | `engine/rdap.py` | Registrar + hosting-network abuse contacts from public RDAP (free, no key). Every field may be `None` |
 | `engine/score.py` | **Stage C.** Combine Stage A reasons + page evidence into a `Verdict`; deterministic, versioned |
-| `engine/store.py` | SQLite store + audit log + case assignment (campaign linking) + counts |
+| `engine/store.py` | Postgres store + audit log + case assignment (campaign linking) + counts |
 | `engine/notices.py` | Drafts notices from `channels.yaml` templates, filled **only** from captured evidence |
 | `engine/worker.py` | `Watch`: queue, capture workers, retry of unreachable hosts, SSE `publish`; also a CLI |
 | `engine/api.py` | FastAPI app, lifespan wiring, SSE stream, all HTTP routes, report maths |
@@ -140,7 +223,7 @@ A shared registrar, host or copied favicon is **not** enough: it would smear inn
 
 ---
 
-## 3. Data model (SQLite, `engine/store.py`)
+## 3. Data model (Postgres, `engine/store.py`; schema in `migrations/`; brand tables in `0002_brand_identity.py`)
 
 | Table | Key columns |
 |---|---|
@@ -270,8 +353,7 @@ Tests that capture need Chromium installed (`uv run playwright install chromium`
 - **New API route:** add it to `engine/api.py`, return plain dicts from `Store`, validate bodies with Pydantic models,
   raise `HTTPException(409, "<readable reason>")` for state-machine violations, and add the type + method to the
   frontend `src/api.ts`.
-- **New table/column:** add to the `SCHEMA` string in `store.py`. There is **no migration system**: `CREATE TABLE IF NOT
-  EXISTS` only. For a column on an existing table either delete `data/haul16.db` (dev) or write a small migration.
+- **New table/column:** add to the `SCHEMA` string in `store.py`. Add an **Alembic migration** in `migrations/versions/` (they run automatically on start and in tests).
 
 ---
 
@@ -492,7 +574,7 @@ your host's secret store), never in git. `.env` is already git-ignored.
 ## 10. Known gaps / ideas
 
 - No auth: the approver is a free-text name sent by the client. A real deployment needs login and role checks.
-- No migrations (see above). SQLite single-writer; fine for the demo scale.
+- Timestamps are ISO-8601 TEXT (not `timestamptz`) to keep the API and frontend format identical; convert in a later migration if needed.
 - Single brand per process. `brand.yaml` has no edit UI.
 - CT log list is hard-coded in `ct_poll.LOGS` (Google Argon and Xenon 2026h2, Cloudflare Nimbus 2026, Sectigo Elephant and Tiger 2026h2); rotate when logs retire.
 - RDAP bootstrap uses `https://rdap.org`; add caching and rate limiting before heavy use.

@@ -16,17 +16,22 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from engine import ct_poll, notices
+from engine import ct_poll, jobs, notices
+from engine.brand import routes as brand_routes
+from engine.brand.import_yaml import import_yaml
+from engine.brand.loader import brand_from_db
+from engine.brand.repo import BrandRepo
+from engine.worker_main import handlers as job_handlers
 from engine.pipeline import Pipeline
 from engine.settings import get_settings
 from engine.store import Store
-from engine.worker import Watch, load_brand
+from engine.worker import Watch
 
 ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE = ROOT / "data" / "evidence"
@@ -84,14 +89,22 @@ async def stats_ticker() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    brand, cfg = load_brand(ROOT / "brand.yaml")
     S.store = Store()
+    repo = BrandRepo(S.store)
+    if not repo.list_all():
+        import_yaml(S.store)                       # first run: seed the fictional demo brand from brand.yaml
+    row = S.store.db.execute("SELECT id FROM brands WHERE is_active LIMIT 1").fetchone() or S.store.db.execute(
+        "SELECT id FROM brands WHERE status='ready' ORDER BY created_at LIMIT 1").fetchone()
+    brand, cfg = brand_from_db(repo, row["id"])
     S.watch = Watch(brand, S.store, brand_cfg=cfg, workers=2)
     S.pipe = Pipeline(S.watch.matcher, ROOT / "data" / "hits.jsonl", on_hit=S.watch.on_hit)
     S.lag, S.started = {}, time.monotonic()
     S.watch.recover()          # threats left 'queued' by a restart go back on the capture queue
+    brand_routes.bind(S)
     tasks = [asyncio.create_task(S.watch.capture_worker()) for _ in range(S.watch.workers)]
     tasks.append(asyncio.create_task(stats_ticker()))
+    if SETTINGS.embedded_worker:
+        tasks.append(asyncio.create_task(jobs.run_worker(S.store, job_handlers(S.store))))
     if CT_ENABLED:
         tasks.append(asyncio.create_task(ct_loop()))
     yield
@@ -102,33 +115,51 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="HAUL16", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=SETTINGS.origins,
                    allow_methods=["*"], allow_headers=["*"])
-app.mount("/demo-sites", StaticFiles(directory=ROOT / "fixtures" / "sites", html=True), name="demo-sites")
+app.include_router(brand_routes.router)
+if not SETTINGS.is_prod:                          # demo fixtures and demo routes are development-only
+    app.mount("/demo-sites", StaticFiles(directory=ROOT / "fixtures" / "sites", html=True), name="demo-sites")
+
+
+def bid(brand_id: str | None = None, x_brand_id: str | None = Header(default=None)) -> str:
+    """The brand a request is about: ?brand_id=, else the X-Brand-Id header, else the brand the pipeline is watching."""
+    return brand_id or x_brand_id or S.watch.brand.brand_id
 
 
 # ---- brand, stats, feed -----------------------------------------------------
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "dry_run": True, "ct_enabled": CT_ENABLED}
+    """Liveness plus what is configured. Reports which collectors have keys, never the keys."""
+    try:
+        S.store.db.execute("SELECT 1")
+        db_ok = True
+        queued = S.store.db.execute("SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued','running')").fetchone()["n"]
+    except Exception:  # noqa: BLE001
+        db_ok, queued = False, None
+    return {"ok": db_ok, "dry_run": SETTINGS.haul16_dry_run, "ct_enabled": CT_ENABLED, "env": SETTINGS.haul16_env, "db": db_ok,
+            "jobs_pending": queued, "embedded_worker": SETTINGS.embedded_worker,
+            "collectors": {"llm": bool(SETTINGS.openai_api_key if SETTINGS.llm_provider == "openai" else SETTINGS.anthropic_api_key),
+                           "firecrawl": bool(SETTINGS.firecrawl_api_key), "apify": bool(SETTINGS.apify_token and SETTINGS.apify_linkedin_actor),
+                           "search": bool(SETTINGS.search_api_key), "urlscan": bool(SETTINGS.urlscan_api_key)}}
 
 
 @app.get("/api/brand")
-def brand():
-    cfg = dict(S.watch.brand_cfg)
+def brand(b: str = Depends(bid)):
+    cfg = dict(S.watch.brand_cfg) if b == S.watch.brand.brand_id else brand_from_db(BrandRepo(S.store), b)[1]
     ref, sha = notices.letter(cfg)
     cfg["authorisation_letter"] = {"ref": ref, "sha256": sha}
     return cfg
 
 
 @app.get("/api/stats")
-def stats():
-    return {"counts": S.store.counts(S.watch.brand.brand_id), "ct": ct_snapshot(),
+def stats(b: str = Depends(bid)):
+    return {"counts": S.store.counts(b), "ct": ct_snapshot(),
             "queue": S.watch.queue.qsize(), "dry_run": True}
 
 
 @app.get("/api/threats")
-def threats(confidence: str | None = None, limit: int = 200):
-    rows = S.store.threats(S.watch.brand.brand_id, limit=limit, confidence=confidence)
+def threats(confidence: str | None = None, limit: int = 200, b: str = Depends(bid)):
+    rows = S.store.threats(b, limit=limit, confidence=confidence)
     for r in rows:                                   # keep the list light
         cap = r.pop("capture", None) or {}
         r["screenshot_ref"] = cap.get("screenshot_ref")
@@ -146,8 +177,8 @@ def threat(tid: str):
 
 
 @app.get("/api/cases")
-def cases():
-    return S.store.cases(S.watch.brand.brand_id)
+def cases(b: str = Depends(bid)):
+    return S.store.cases(b)
 
 
 @app.get("/api/cases/{case_id}")
@@ -178,10 +209,10 @@ def audit(limit: int = 100):
 # ---- notices: human approval is enforced here ---------------------------------
 
 @app.get("/api/notices")
-def list_notices(status: str | None = None):
+def list_notices(status: str | None = None, b: str = Depends(bid)):
     if status and status not in ("drafted", "approved", "filed_dry_run", "rejected"):
         raise HTTPException(422, "Unknown notice status")
-    return S.store.all_notices(S.watch.brand.brand_id, status)
+    return S.store.all_notices(b, status)
 
 
 class Approve(BaseModel):
@@ -260,6 +291,8 @@ class DemoIn(BaseModel):
 
 @app.post("/api/demo/clone")
 def demo_clone(body: DemoIn):
+    if SETTINGS.is_prod:
+        raise HTTPException(404, "Demo routes are disabled")
     """Push a fictional fixture site through the real pipeline (served by this API)."""
     host = DEMO_HOSTS[body.variant]
     url = f"http://127.0.0.1:{PORT}/demo-sites/{body.variant}/"
@@ -272,6 +305,8 @@ def demo_clone(body: DemoIn):
 
 @app.post("/api/demo/reset")
 def demo_reset():
+    if SETTINGS.is_prod:
+        raise HTTPException(404, "Demo routes are disabled")
     """Wipe cases, threats and notices (demo rehearsal only)."""
     for t in ("threats", "cases", "identifiers", "notices", "clock_events", "audit_log"):
         S.store.db.execute(f"DELETE FROM {t}")
@@ -301,15 +336,15 @@ def _ts(s: str) -> datetime:
 
 
 @app.get("/api/report")
-def report(month: str | None = None):
+def report(month: str | None = None, b: str = Depends(bid)):
     month = month or datetime.now().strftime("%Y-%m")
     if not re.fullmatch(r"\d{4}-\d{2}", month):
         raise HTTPException(400, "month must be YYYY-MM")
-    bid = S.watch.brand.brand_id
+    brand_pk = b
     in_month = lambda ts: bool(ts) and ts.startswith(month)  # noqa: E731
-    threats_ = [t for t in S.store.threats(bid, limit=100000) if in_month(t["detected_at"])]
-    cases_ = [c for c in S.store.cases(bid) if in_month(c["opened_at"])]
-    events = [e for e in S.store.all_clock(bid) if in_month(e["ts"])]
+    threats_ = [t for t in S.store.threats(brand_pk, limit=100000) if in_month(t["detected_at"])]
+    cases_ = [c for c in S.store.cases(brand_pk) if in_month(c["opened_at"])]
+    events = [e for e in S.store.all_clock(brand_pk) if in_month(e["ts"])]
 
     filed_at = {e["notice_id"]: e["ts"] for e in events if e["event"] == "filed"}
     per_channel: dict[str, dict] = {}

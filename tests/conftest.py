@@ -3,6 +3,14 @@ import os
 
 import pytest
 
+# Point the whole process at the TEST database before anything reads settings, so tests can never touch a dev or prod database.
+os.environ.setdefault("TEST_DATABASE_URL", "postgresql://haul16:haul16@127.0.0.1:55433/haul16_test")
+os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
+os.environ["HAUL16_CT"] = "0"
+os.environ["EMBEDDED_WORKER"] = "false"
+for _k in ("OPENAI_API_KEY", "FIRECRAWL_API_KEY", "APIFY_TOKEN", "SEARCH_API_KEY", "URLSCAN_API_KEY"):
+    os.environ[_k] = ""          # tests never call real vendors; collectors without a key skip
+
 from engine.db import Database, can_connect, migrate
 from engine.settings import get_settings
 from engine.store import Store

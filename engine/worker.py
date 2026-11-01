@@ -45,6 +45,10 @@ class Watch:
         self.retry_after = RETRY_AFTER_S
         self.subscribers: set[asyncio.Queue] = set()
 
+    def set_brand(self, brand: Brand, cfg: dict) -> None:
+        """Switch the brand this watcher detects for (the dossier changed or another brand was activated)."""
+        self.brand, self.brand_cfg, self.matcher = brand, cfg, Matcher(brand)
+
     # ---- live events for the UI -------------------------------------------
 
     def publish(self, event: dict) -> None:

@@ -55,6 +55,8 @@ def claims(brand_name: str, verdict: dict) -> list[str]:
 
 
 def letter(brand_cfg: dict) -> tuple[str, str]:
+    if brand_cfg.get("authorisation_letter_sha256"):          # brands onboarded through the API store the hash directly
+        return brand_cfg.get("authorisation_letter") or "uploaded letter", brand_cfg["authorisation_letter_sha256"]
     ref = brand_cfg.get("authorisation_letter")
     if not ref:
         return "not on file", "unknown"
