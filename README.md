@@ -159,11 +159,37 @@ New environment variables: `PUBLIC_URL`, `PATROL_HOURS`, `SMTP_HOST`, `SMTP_PORT
 | POST | `/api/brands/{id}/activate` | point the CT matcher and capture workers at this brand |
 Other routes accept `?brand_id=` or the `X-Brand-Id` header and default to the active brand. `GET /api/health` reports `db`, `jobs_pending` and which collectors are configured (booleans only).
 
-### Deploying (Railway + Neon)
-Two services from this repo's Dockerfile (branch `live`): **api** (default start command, `HAUL16_ENV=prod`, `EMBEDDED_WORKER=false`) and **worker**
-(start command `python -m engine.worker_main`). Set `DATABASE_URL` (Neon), `FRONTEND_ORIGINS` (the Vercel URL), `HAUL16_ENV=prod`, and the collector keys.
-`HAUL16_ENV=prod` turns `/demo-sites` and the demo routes off. `GET /api/health` is the health check. The first start applies migrations and seeds the
-fictional demo brand if no brand exists; in production create the real brand through the API and activate it.
+### Deploying (Railway + Neon + Vercel)
+**One Railway service** from this repo's Dockerfile (branch `live`), with the embedded worker on. Do not add a second worker service: the look-alike sweep and
+discovery run only in the API process (they need its `Watch` queue). Migrations run on start. `GET /api/health` is the health check (already in `railway.json`).
+
+1. **Neon:** create a project and copy the **direct** (not `-pooler`) connection string. It must end with `?sslmode=require`.
+2. **Railway:** New Project, Deploy from GitHub repo `haul16-backend`, set the service branch to `live`, paste the variables below (Variables, Raw Editor),
+   then Networking, Generate Domain. The first build installs Chromium and takes several minutes.
+3. **Check:** `curl https://<railway-domain>/api/health` returns `ok: true`, `env: "prod"`, `db: true`, and `true` for each collector key you set.
+4. **Vercel (frontend repo):** the site calls relative `/api/...` URLs, so `vercel.json` needs a rewrite `/api/:path*` -> `https://<railway-domain>/api/:path*`
+   placed **before** the catch-all rewrite. That makes the API same-origin for the browser (the sign-in cookie is `SameSite=Lax`, so a cross-domain call would not carry it).
+   Make sure the Vercel project's Production Branch is `live`. Without the rewrite the site falls back to built-in sample data.
+
+| Variable | Value |
+|---|---|
+| `HAUL16_ENV` | `prod` (turns the demo routes off; the API refuses to start without `AUTH_OWNER_PASSWORD` and `SESSION_SECRET`) |
+| `EMBEDDED_WORKER` | `true` |
+| `HAUL16_CT` | `0` while testing (live certificate watching is steady CPU, memory and bandwidth); `1` to turn it on |
+| `HAUL16_DRY_RUN` | `1` (nothing is ever sent) |
+| `SEED_DEMO_BRAND` | `false` |
+| `DATABASE_URL` | the Neon direct connection string, ending `?sslmode=require` |
+| `FRONTEND_ORIGINS`, `PUBLIC_URL` | the Vercel URL, `https://...`, no trailing slash |
+| `AUTH_OWNER_EMAIL`, `AUTH_OWNER_PASSWORD`, `SESSION_SECRET` | the owner login; a strong password; `openssl rand -hex 32` |
+| `LLM_PROVIDER`, `LLM_MODEL`, `GEMINI_API_KEY` | `gemini`, `gemini-2.5-flash`, your key |
+| `SEARCH_PROVIDER`, `FIRECRAWL_API_KEY` | `firecrawl`, your key (search, press and the LinkedIn step) |
+| `BROWSERBASE_API_KEY`, `BROWSERBASE_PROXY`, `BROWSERBASE_COUNTRY` | your key, `true`, `GH` (remote browser for evidence capture; empty = local Chromium) |
+| `URLSCAN_API_KEY` | your key |
+| not needed | `SEARCH_API_KEY` (Brave only), `META_AD_LIBRARY_TOKEN`, `APIFY_*`, `SMTP_*`, `ALERT_*`; `PORT` is set by Railway |
+
+Known limits of a first deploy: Railway's disk is wiped on every redeploy, so `data/evidence` (screenshots, page source) is lost until a Volume is mounted at `/app/data`
+(the image runs as a non-root user, so a Volume may also need `RAILWAY_RUN_UID=0`; check Railway's current docs). Neon's free tier sleeps when idle, so the first request after a
+pause is slow. The sign-in rate limit is per connecting IP, which behind Vercel and Railway is a proxy address; use a long password.
 
 ---
 

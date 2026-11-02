@@ -14,7 +14,8 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 RUN uv run playwright install --with-deps chromium && chmod -R a+rX /opt/ms-playwright
 
 COPY . .
-RUN useradd -m haul16 && chown -R haul16 /app /home/haul16
+# Only data/ (evidence, logs) is written at runtime. chown-ing all of /app would copy the whole virtualenv into another ~500 MB layer.
+RUN useradd -m haul16 && mkdir -p /app/data && chown -R haul16 /app/data /home/haul16
 USER haul16
 ENV PATH="/app/.venv/bin:$PATH"
 
