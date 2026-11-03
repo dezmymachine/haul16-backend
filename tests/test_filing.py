@@ -252,3 +252,72 @@ def test_liveness_endpoints(client):
     assert client.get(f"/api/cases/{case_id}/liveness").json() == []
     assert client.get("/api/cases/nope/liveness").status_code == 404
     assert client.post("/api/cases/nope/liveness").status_code == 404
+
+
+def test_inbound_consumer_verification_and_reporting(client, monkeypatch):
+    # Mock watch.inject to avoid triggering asynchronous Playwright browser launches in unit test
+    monkeypatch.setattr(api.S.watch, "inject", lambda u, as_host=None, source="manual": "thr_inbound_mock_1")
+
+    # 1. Test fraudulent message with unverified MTN MoMo number and lookalike domain
+    fraud_msg = (
+        "Hello customer, deposit GHS 500 now to double your crypto! "
+        "Send to MTN MoMo 055 412 3456 (Ref: YC) or claim on yellowcard-promo-gh.invalid"
+    )
+    res = client.post("/api/inbound/verify", json={
+        "message": fraud_msg,
+        "sender": "0249998888",
+        "channel": "whatsapp",
+        "auto_inject": True,
+    })
+    assert res.status_code == 200
+    data = res.json()
+    assert data["verdict"] == "FRAUD_DETECTED"
+    assert data["is_official"] is False
+    assert "0554123456" in data["extracted"]["unauthorized_phones"]
+    assert any("yellowcard-promo-gh.invalid" in u for u in data["extracted"]["unauthorized_urls"])
+    assert "FRAUD WARNING" in data["warning_message"]
+    assert len(data["injected_threats"]) >= 1
+
+    # 2. Test official message
+    official_msg = "Visit our official support page at https://nkwaex.com for assistance."
+    res2 = client.post("/api/inbound/verify", json={
+        "message": official_msg,
+        "channel": "sms",
+        "auto_inject": False,
+    })
+    assert res2.status_code == 200
+    data2 = res2.json()
+    assert data2["verdict"] == "LIKELY_OFFICIAL"
+    assert data2["is_official"] is True
+
+
+def test_gsma_momo_report_and_api_filing(client):
+    from engine import senders
+    # 1. Test GSMA MoMo report generation
+    notice = {"id": "ntc_test", "case_id": "case_test"}
+    threat = {
+        "id": "thr_test",
+        "hostname": "fake-yellowcard.top",
+        "url": "https://fake-yellowcard.top",
+        "detected_at": "2026-11-03T06:00:00Z",
+        "capture": {
+            "captured_at": "2026-11-03T06:01:00Z",
+            "html_sha256": "abc123sha",
+            "screenshot_sha256": "def456sha",
+            "identifiers": {"phones": ["0554123456"]},
+        },
+    }
+    brand = {"display_name": "Yellow Card Ghana", "authorisation_letter_sha256": "letter123"}
+    rep = senders.build_gsma_momo_report(notice, threat, brand)
+    assert rep["specification"] == "GSMA-MM-FRAUD-v1.0"
+    assert rep["statutory_basis"]["section"] == "92 (Take-down notification & liability)"
+    assert "0554123456" in rep["fraudulent_payment_identifiers"]["mobile_money_numbers"]
+    assert rep["evidentiary_hashes"]["page_source_sha256"] == "abc123sha"
+
+    # 2. Test filing with mode="api" for Google Safe Browsing
+    nid, case_id = approved(client, method="web_form", verified=True)
+    api.S.store.db.execute("UPDATE notices SET channel='google_safe_browsing', channel_name='Google Safe Browsing' WHERE id=?", (nid,))
+    res = client.post(f"/api/notices/{nid}/file", json={"mode": "api"})
+    assert res.status_code == 200
+    filed_n = res.json()
+    assert filed_n["status"] == "filed"

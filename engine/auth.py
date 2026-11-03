@@ -77,7 +77,7 @@ class AuthMiddleware:
         if scope["type"] != "http" or not enabled():
             return await self.app(scope, receive, send)
         path = scope["path"]
-        if not path.startswith("/api/") or path == "/api/health" or path.startswith("/api/auth/") or scope["method"] == "OPTIONS":
+        if not path.startswith("/api/") or path == "/api/health" or path.startswith("/api/auth/") or path.startswith("/api/inbound/") or scope["method"] == "OPTIONS":
             return await self.app(scope, receive, send)
         email = read_token(_cookie_from(scope.get("headers", [])))
         if not email:

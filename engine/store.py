@@ -198,12 +198,17 @@ class Store:
         self.audit(approver, "notice_rejected", nid, {"reason": reason})
 
     def file_notice(self, nid: str, actor: str, mode: str = "dry_run", note: str | None = None, detail: dict | None = None) -> None:
-        """mode: dry_run (nothing sent, simulated clock), manual (a person filed it on the recipient's own site), email (HAUL16 sent it)."""
+        """mode: dry_run (nothing sent, simulated clock), manual (a person filed it on the recipient's own site), email (HAUL16 sent it), api (automated API)."""
         n = self.notice(nid)
         ts = now()
-        real = mode in ("manual", "email")
+        real = mode in ("manual", "email", "api")
         self.db.execute("UPDATE notices SET status=?, filed_at=? WHERE id=?", ("filed" if real else "filed_dry_run", ts, nid))
-        default = {"dry_run": "Dry run: nothing was sent.", "manual": "Filed by hand by a person.", "email": "Sent by email by HAUL16."}[mode]
+        default = {
+            "dry_run": "Dry run: nothing was sent.",
+            "manual": "Filed by hand by a person.",
+            "email": "Sent by email by HAUL16.",
+            "api": "Submitted via direct API by HAUL16.",
+        }[mode]
         self.clock_event(n["case_id"], nid, n["channel"], "filed", note or default, ts=ts, simulated=not real)
         self.audit(actor, "notice_filed" if real else "notice_filed_dry_run", nid, {"mode": mode, **(detail or {})})
 

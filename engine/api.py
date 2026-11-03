@@ -14,6 +14,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -23,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from engine import alerts, auth, ct_poll, discovery, jobs, liveness, notices, pack, patrol, senders
+from engine.extract import extract
 from engine.brand import routes as brand_routes
 from engine.brand.import_yaml import import_yaml
 from engine.brand.loader import NO_BRAND, brand_from_db
@@ -317,14 +319,17 @@ def reject(nid: str, body: Reject, request: Request):
 
 
 class FileIn(BaseModel):
-    mode: str = Field(default="dry_run", pattern="^(dry_run|manual|email)$")
+    mode: str = Field(default="dry_run", pattern="^(dry_run|manual|email|api)$")
     reference: str | None = Field(default=None, max_length=300)      # for "manual": where it was filed, or the reference you were given
 
 
 @app.post("/api/notices/{nid}/file")
 async def file_notice(nid: str, request: Request, body: FileIn | None = None):
-    """Three ways to file an approved notice. dry_run: nothing leaves the server. manual: a person filed it on the recipient's own site and
-    records it here. email: HAUL16 sends it (only when HAUL16_DRY_RUN is off, SMTP is configured and the recipient address is verified)."""
+    """Four ways to file an approved notice:
+    dry_run: nothing leaves the server (simulated clock).
+    manual: a person filed it on the recipient's own site and records it here.
+    email: HAUL16 sends it with Act 772 evidence pack + GSMA MoMo fraud report (only when HAUL16_DRY_RUN is off).
+    api: direct programmatic fast-path submission (e.g. Google Safe Browsing / Web Risk)."""
     body = body or FileIn()
     n = _notice(nid)
     if n["status"] != "approved":
@@ -350,10 +355,21 @@ async def file_notice(nid: str, request: Request, body: FileIn | None = None):
         attachments = [("evidence-pack.zip", pack.build_pack(n, threat, case_brand), "application/zip")]
         if (lf := pack.letter_file(case_brand)):
             attachments.insert(0, (f"authorisation-letter{lf.suffix}", lf.read_bytes(), "application/octet-stream"))
+        if n["channel"].startswith("telco_"):
+            gsma_rep = senders.build_gsma_momo_report(n, threat, case_brand)
+            attachments.append(("gsma-momo-fraud-report.json", json.dumps(gsma_rep, indent=2).encode(), "application/json"))
+            detail["gsma_momo_report"] = gsma_rep
         try:
             detail["message_id"] = await senders.send_email(n["recipient"], n["subject"], n["body"], attachments)
         except Exception as e:  # noqa: BLE001
             raise HTTPException(502, f"The email could not be sent: {e}") from e
+    elif body.mode == "api":
+        threat = S.store.threat(n["threat_id"])
+        target_url = (threat.get("capture") or {}).get("final_url") or threat.get("url") or f"https://{threat.get('hostname')}/"
+        if n["channel"] == "google_safe_browsing":
+            detail["api_submission"] = await senders.submit_google_safe_browsing(target_url, case_brand["display_name"], n.get("subject", ""))
+        else:
+            raise HTTPException(400, f"Channel '{n['channel']}' does not have a direct API integration yet. Use 'email' or 'manual'.")
     S.store.file_notice(nid, n["approved_by"], body.mode, (body.reference or None), detail)
     S.watch.publish({"type": "filed", "notice_id": nid, "case_id": n["case_id"], "channel": n["channel"]})
     return S.store.notice(nid)
@@ -390,6 +406,115 @@ async def case_liveness_run(case_id: str):
         raise HTTPException(404, "No such case")
     await liveness.check_case(S.store, case_id)
     return liveness.latest(S.store, case_id)
+
+
+# ---- inbound consumer intake ("Is This Us?") -------------------------------
+
+class InboundVerifyIn(BaseModel):
+    message: str = Field(min_length=3, max_length=5000)
+    sender: str | None = Field(default=None, max_length=100)
+    channel: str = Field(default="whatsapp", pattern="^(whatsapp|sms|web|email)$")
+    auto_inject: bool = Field(default=True)
+
+
+@app.post("/api/inbound/verify")
+def inbound_verify(body: InboundVerifyIn):
+    """Consumer intake & verification endpoint ('Is This Us?' line).
+    Receives forwarded SMS/WhatsApp messages, extracts Ghanaian MoMo numbers,
+    crypto wallets, and links, compares them against the brand register,
+    returns an instant safety verdict & warning, and auto-injects threats into triage.
+    """
+    brand = S.watch.brand
+    cfg = S.watch.brand_cfg
+    if not brand or brand.brand_id == "__none__":
+        row = S.store.db.execute("SELECT id FROM brands WHERE is_active LIMIT 1").fetchone()
+        if row:
+            brand, cfg = brand_from_db(BrandRepo(S.store), row["id"])
+        else:
+            raise HTTPException(409, "No active protected brand configured on the desk")
+
+    extracted = extract(body.message)
+    phones = extracted.phones
+    wallets = extracted.wallets
+    telegram = extracted.telegram
+    whatsapp = extracted.whatsapp
+
+    url_pattern = re.compile(r"https?://[^\s]+|(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(?:/[^\s]*)?")
+    raw_urls = url_pattern.findall(body.message)
+    cleaned_urls = []
+    for u in raw_urls:
+        u = u.strip(".,;:()[]{}<>\"'")
+        if not u.startswith("http://") and not u.startswith("https://"):
+            u = "https://" + u
+        cleaned_urls.append(u)
+
+    official_numbers = set(cfg.get("official_numbers") or [])
+    official_wallets = set(cfg.get("official_wallets") or [])
+    official_domains = {d.lower() for d in (cfg.get("official_domains") or [])}
+
+    unauthorized_phones = [p for p in phones if p not in official_numbers]
+    unauthorized_wallets = {k: [w for w in v if w not in official_wallets] for k, v in wallets.items()}
+    unauthorized_wallets = {k: v for k, v in unauthorized_wallets.items() if v}
+
+    unauthorized_urls = []
+    for u in cleaned_urls:
+        host = urlparse(u).hostname or ""
+        if not any(host.lower() == d or host.lower().endswith("." + d) for d in official_domains):
+            unauthorized_urls.append(u)
+
+    is_fraud = bool(unauthorized_phones or unauthorized_wallets or unauthorized_urls)
+    brand_name = brand.display_name or "Official Service"
+    if is_fraud:
+        issues = []
+        if unauthorized_phones:
+            issues.append(f"Phone/MoMo: {', '.join(unauthorized_phones)}")
+        if unauthorized_urls:
+            issues.append(f"Link(s): {', '.join(unauthorized_urls)}")
+        if unauthorized_wallets:
+            issues.append("Crypto wallet(s)")
+        verdict = "FRAUD_DETECTED"
+        warning = (
+            f"⚠️ FRAUD WARNING: This message is NOT from {brand_name}. "
+            f"The payment identifier(s) or link ({'; '.join(issues)}) are NOT authorized by {brand_name}. "
+            f"Do NOT send Mobile Money, cash, or login credentials."
+        )
+    else:
+        verdict = "LIKELY_OFFICIAL"
+        warning = f"✓ Verified: The identifiers match the official public directory for {brand_name}."
+
+    injected_threats = []
+    if is_fraud and body.auto_inject:
+        for u in unauthorized_urls:
+            tid = S.watch.inject(u, None, source=f"inbound_{body.channel}")
+            if tid:
+                injected_threats.append({"url": u, "threat_id": tid})
+
+    S.store.audit("inbound_consumer", "intake_verified", brand.brand_id, {
+        "channel": body.channel,
+        "sender": body.sender,
+        "verdict": verdict,
+        "unauthorized_phones": unauthorized_phones,
+        "unauthorized_urls": unauthorized_urls,
+        "injected": [t["threat_id"] for t in injected_threats],
+    })
+
+    return {
+        "verdict": verdict,
+        "is_official": not is_fraud,
+        "brand_name": brand_name,
+        "warning_message": warning,
+        "extracted": {
+            "phones": phones,
+            "unauthorized_phones": unauthorized_phones,
+            "wallets": wallets,
+            "unauthorized_wallets": unauthorized_wallets,
+            "urls": cleaned_urls,
+            "unauthorized_urls": unauthorized_urls,
+            "telegram": telegram,
+            "whatsapp": whatsapp,
+        },
+        "injected_threats": injected_threats,
+    }
 
 
 # ---- intake -----------------------------------------------------------------
