@@ -12,8 +12,10 @@ import argparse
 import asyncio
 import base64
 import json
+import re
 import struct
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -24,16 +26,97 @@ from engine.pipeline import Pipeline
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Usable RFC 6962 logs for certs expiring in late 2026 / 2027 (Google log list v3, 30 Oct 2026).
-LOGS = {
+# Google Certificate Transparency v3 log list (all usable logs)
+LOG_LIST_URL = "https://www.gstatic.com/ct/log_list/v3/log_list.json"
+CACHE_PATH = ROOT / "data" / "ct_log_list.json"
+
+# Baseline usable RFC 6962 logs for certs expiring in late 2026 / 2027
+DEFAULT_LOGS = {
     "google_argon2026h2": "https://ct.googleapis.com/logs/us1/argon2026h2/",
     "google_xenon2026h2": "https://ct.googleapis.com/logs/eu1/xenon2026h2/",
     "cloudflare_nimbus2026": "https://ct.cloudflare.com/logs/nimbus2026/",
     "sectigo_elephant2026h2": "https://elephant2026h2.ct.sectigo.com/",
     "sectigo_tiger2026h2": "https://tiger2026h2.ct.sectigo.com/",
 }
+LOGS: dict[str, str] = dict(DEFAULT_LOGS)
+
 BATCH = 256          # logs cap batch size anyway; we take what they return
 PARALLEL = 8         # concurrent get-entries requests per log
+
+
+def _parse_iso(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+async def discover_logs(client: httpx.AsyncClient | None = None, now: datetime | None = None,
+                        cache_path: Path | None = CACHE_PATH) -> dict[str, str]:
+    """Dynamically sync with Google's official Certificate Transparency v3 catalog.
+
+    Queries all_log_list / log_list from https://www.gstatic.com/ct/log_list/v3/log_list.json,
+    discovering active qualified logs across Google, Cloudflare, DigiCert, Sectigo and TrustAsia.
+    Falls back gracefully to cached data or DEFAULT_LOGS on network error.
+    """
+    now = now or datetime.now(timezone.utc)
+    data = None
+    close_client = False
+    if client is None:
+        client = httpx.AsyncClient(timeout=10, headers={"User-Agent": "haul16-ct-discovery/0.1"})
+        close_client = True
+    try:
+        resp = await client.get(LOG_LIST_URL)
+        if resp.status_code == 200:
+            data = resp.json()
+            if cache_path:
+                try:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    cache_path.write_text(json.dumps(data))
+                except Exception:
+                    pass
+    except Exception as e:
+        pass
+    finally:
+        if close_client:
+            await client.aclose()
+
+    if not data and cache_path and cache_path.exists():
+        try:
+            data = json.loads(cache_path.read_text())
+        except Exception:
+            data = None
+
+    if not data:
+        return dict(DEFAULT_LOGS)
+
+    discovered: dict[str, str] = {}
+    for op in data.get("operators", []):
+        op_name = op.get("name", "unknown").lower().replace(" ", "_")
+        for log in op.get("logs", []):
+            state = log.get("state", {})
+            if "usable" not in state:
+                continue
+            interval = log.get("temporal_interval")
+            if interval:
+                try:
+                    start = _parse_iso(interval["start_inclusive"])
+                    end = _parse_iso(interval["end_exclusive"])
+                    # Include logs covering certificates valid now or within the upcoming 120-day window
+                    if not (start <= now + timedelta(days=120) and end > now):
+                        continue
+                except Exception:
+                    pass
+            desc = log.get("description", "")
+            slug = re.sub(r"[^a-z0-9]+", "_", f"{op_name}_{desc}".lower()).strip("_")
+            url = log.get("url")
+            if url:
+                if not url.endswith("/"):
+                    url += "/"
+                discovered[slug] = url
+
+    if discovered:
+        LOGS.clear()
+        LOGS.update(discovered)
+        return dict(discovered)
+    return dict(DEFAULT_LOGS)
 
 
 def _u24(b: bytes, off: int) -> tuple[int, int]:

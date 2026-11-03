@@ -54,8 +54,13 @@ S = State()
 
 
 async def ct_loop() -> None:
-    """Follow every CT log; restart a log's follower if it dies."""
-    limits = httpx.Limits(max_connections=ct_poll.PARALLEL * len(ct_poll.LOGS))
+    """Follow every CT log; dynamically sync with Google's CT catalog; restart a log's follower if it dies."""
+    try:
+        await ct_poll.discover_logs()
+    except Exception as e:
+        print(f"ct_loop: initial discovery failed ({e!r})", flush=True)
+
+    limits = httpx.Limits(max_connections=ct_poll.PARALLEL * max(len(ct_poll.LOGS), 10))
     async with httpx.AsyncClient(timeout=20, limits=limits,
                                  headers={"User-Agent": "haul16-ct-monitor/0.1"}) as client:
         async def keep(name, url):
@@ -66,7 +71,7 @@ async def ct_loop() -> None:
                 except Exception as e:
                     print(f"ct {name} restarting after {e!r}", flush=True)
                     await asyncio.sleep(5)
-        await asyncio.gather(*(keep(n, u) for n, u in ct_poll.LOGS.items()))
+        await asyncio.gather(*(keep(n, u) for n, u in list(ct_poll.LOGS.items())))
 
 
 def ct_snapshot() -> dict:

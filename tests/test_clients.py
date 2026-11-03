@@ -127,3 +127,53 @@ def test_llm_gives_up_after_invalid_output(keys, store):
     asyncio.run(go())
     row = store.db.execute("SELECT ok, purpose FROM llm_calls").fetchone()
     assert row["ok"] is False and row["purpose"] == "test"
+
+
+def test_discover_ct_logs():
+    from datetime import datetime, timezone
+    from engine.ct_poll import discover_logs, DEFAULT_LOGS
+
+    mock_catalog = {
+        "version": "1.0",
+        "operators": [
+            {
+                "name": "Google",
+                "logs": [
+                    {
+                        "description": "Google Test Log Active",
+                        "url": "https://ct.googleapis.com/logs/test/",
+                        "state": {"usable": {}},
+                        "temporal_interval": {
+                            "start_inclusive": "2026-01-01T00:00:00Z",
+                            "end_exclusive": "2027-01-01T00:00:00Z",
+                        },
+                    },
+                    {
+                        "description": "Google Test Log Expired",
+                        "url": "https://ct.googleapis.com/logs/expired/",
+                        "state": {"usable": {}},
+                        "temporal_interval": {
+                            "start_inclusive": "2020-01-01T00:00:00Z",
+                            "end_exclusive": "2021-01-01T00:00:00Z",
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+
+    async def go():
+        # 1. Success case parsing catalog
+        async with client(lambda r: httpx.Response(200, json=mock_catalog)) as c:
+            now = datetime(2026, 11, 2, tzinfo=timezone.utc)
+            discovered = await discover_logs(c, now=now, cache_path=None)
+            assert "google_google_test_log_active" in discovered
+            assert discovered["google_google_test_log_active"] == "https://ct.googleapis.com/logs/test/"
+            assert "google_google_test_log_expired" not in discovered
+
+        # 2. Network error falls back to DEFAULT_LOGS
+        async with client(lambda r: httpx.Response(500)) as c:
+            fallback = await discover_logs(c, cache_path=None)
+            assert all(k in fallback for k in DEFAULT_LOGS)
+
+    asyncio.run(go())
